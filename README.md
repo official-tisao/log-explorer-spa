@@ -1,11 +1,10 @@
 # nginx / Apache log analysis
 
-Two pieces that produce the same report from the same logs:
+Single piece that produces the report from the same logs:
 
 | | |
 |---|---|
-| `scripts/logs/logparse.go` | streaming converter — N raw logs → `combined.log` + `logs.csv` + `rejects.log` |
-| `logs/analysis.html` | the report — reads **either** `logs.csv` **or** the raw `.log` files directly |
+| `analysis.html` | the report — reads **either** `logs.csv` **or** the raw `.log` files directly |
 
 Both are self-contained. The HTML has no CDN, no external fonts, no charting library
 (charts are drawn on `<canvas>`), so it opens from `file://` with nothing running.
