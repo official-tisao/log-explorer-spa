@@ -2180,6 +2180,7 @@ async function ingest(stream, totalBytes, fileName) {
     // The file's kind is set by its first decodable line and then trusted, so a
     // stray unparsable line cannot flip an access log into an error log.
     if (isErrLog === null) isErrLog = r.f[C.SRC] === "error";
+    if (isErrLog === false && /scanners\.log/i.test(name)) r.f[C.SRC] = "scanners";
     r.f[C.FILE] = name;
     prevTS = r.f[C.TS];
     consume(r.f); lines++;
