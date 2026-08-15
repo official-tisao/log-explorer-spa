@@ -9,7 +9,7 @@ Single piece that produces the report from the same logs:
 Both are self-contained. The HTML has no CDN, no external fonts, no charting library
 (charts are drawn on `<canvas>`), so it opens from `file://` with nothing running.
 
-`logs/` is gitignored — raw logs contain visitor IP addresses.
+`logs/` should be gitignored — raw logs contain visitor IP addresses.
 
 ---
 
