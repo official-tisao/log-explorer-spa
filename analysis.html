@@ -1116,7 +1116,10 @@ function paintDrawer() {
     D.idx.sort((a, b) => S.ts.a[a] - S.ts.a[b] || a - b);
     D.sorted = true;
   }
-  const view = (D.sortDesc ? [...D.idx].reverse() : D.idx).slice(start, start + D.per);
+const end = start + D.per;
+const view = D.sortDesc
+  ? D.idx.slice(Math.max(0, total - end), Math.max(0, total - start)).reverse()
+  : D.idx.slice(start, end);
 
   const active = Object.entries(Object.assign({}, D.filter, D.cols))
     .filter(([, v]) => v !== "" && v !== undefined && v !== null && v !== false)
