@@ -1,0 +1,2270 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Log explorer: Infrastructure &amp; Security Log Report</title>
+<!--
+  Single-file report over raw nginx/Apache logs, or over logs/logs.csv
+  (19 columns, `file` last).
+
+  No CDN, no external fonts, no charting library, same posture as the site's CSP,
+  and it means this file still works from a USB stick five years from now.
+
+  Parsing runs on the main thread in chunked slices with a yield between them,
+  NOT in a Web Worker: a blob-URL worker is blocked from a file:// page in Chrome,
+  which is exactly how this report gets opened. The trade is a progress bar
+  instead of a frozen tab.
+
+  Memory is flat regardless of corpus size. Rows are never materialized into an
+  array, only counters, bounded top-N maps and a handful of sample lines are
+  retained, so 200 MB of CSV costs a few tens of MB of heap.
+-->
+<style>
+  :root{
+    --bg:#0e1117; --panel:#161b23; --panel2:#1c222c; --line:#2a3240;
+    --fg:#e6edf3; --dim:#8b98a8; --dimmer:#5e6b7d;
+    --accent:#4c9aff; --ok:#3fb950; --warn:#d29922; --bad:#f85149; --crit:#ff6b6b;
+    --ai:#bc8cff; --seo:#39c5cf;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+  code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  a{color:var(--accent)}
+
+  header{padding:22px 26px;border-bottom:1px solid var(--line);background:var(--panel)}
+  header h1{margin:0;font-size:20px;letter-spacing:-.01em}
+  header .sub{color:var(--dim);font-size:13px;margin-top:5px}
+
+  nav{display:flex;gap:2px;padding:0 18px;background:var(--panel);
+      border-bottom:1px solid var(--line);overflow-x:auto;position:sticky;top:0;z-index:20}
+  nav button{background:none;border:0;border-bottom:2px solid transparent;color:var(--dim);
+             padding:11px 14px;font-size:13px;cursor:pointer;white-space:nowrap;font-weight:500}
+  nav button:hover{color:var(--fg)}
+  nav button.on{color:var(--fg);border-bottom-color:var(--accent)}
+
+  main{padding:22px 26px;max-width:1500px}
+  section{display:none} section.on{display:block}
+  h2{font-size:17px;margin:0 0 4px}
+  h3{font-size:14px;margin:26px 0 10px;color:var(--fg);
+     text-transform:uppercase;letter-spacing:.06em;font-weight:600}
+  .lede{color:var(--dim);margin:0 0 18px;max-width:80ch}
+  .note{color:var(--dim);font-size:12.5px;margin:8px 0 0;max-width:90ch}
+
+  .kpis{display:grid;grid-template-columns:repeat(auto-fill,minmax(215px,1fr));gap:12px}
+  .kpi{background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:14px 15px}
+  .kpi .lab{color:var(--dim);font-size:11.5px;text-transform:uppercase;letter-spacing:.05em}
+  .kpi .val{font-size:25px;font-weight:650;margin:5px 0 2px;letter-spacing:-.02em}
+  .kpi .cap{color:var(--dimmer);font-size:12px}
+  .kpi.ok .val{color:var(--ok)} .kpi.warn .val{color:var(--warn)}
+  .kpi.bad .val{color:var(--bad)} .kpi.ai .val{color:var(--ai)}
+
+  .grid{display:grid;gap:14px}
+  .g2{grid-template-columns:repeat(auto-fit,minmax(430px,1fr))}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:14px 15px}
+  .card h4{margin:0 0 10px;font-size:13px;color:var(--dim);font-weight:600;
+           text-transform:uppercase;letter-spacing:.05em}
+  canvas{width:100%;height:190px;display:block}
+
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:6px 9px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--dim);font-weight:600;font-size:11.5px;text-transform:uppercase;letter-spacing:.04em;
+     position:sticky;top:0;background:var(--panel)}
+  td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
+  tbody tr:hover{background:var(--panel2)}
+  .scroll{max-height:460px;overflow:auto;border:1px solid var(--line);border-radius:9px;background:var(--panel)}
+  .trunc{max-width:520px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+  .bar{height:5px;background:var(--panel2);border-radius:3px;overflow:hidden;margin-top:4px}
+  .bar>i{display:block;height:100%;background:var(--accent)}
+
+  .pill{display:inline-block;padding:1px 7px;border-radius:11px;font-size:11px;font-weight:600;
+        border:1px solid var(--line);color:var(--dim)}
+  .pill.ok{color:var(--ok);border-color:#1d4429} .pill.bad{color:var(--bad);border-color:#5a2222}
+  .pill.warn{color:var(--warn);border-color:#5a4718} .pill.crit{background:#5a1c1c;color:#fff;border-color:#7a2b2b}
+
+  .subtabs{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 16px}
+  .subtabs button{background:var(--panel);border:1px solid var(--line);border-radius:7px;
+                  color:var(--dim);padding:7px 11px;cursor:pointer;font-size:12.5px}
+  .subtabs button.on{border-color:var(--accent);color:var(--fg);background:var(--panel2)}
+  .subtabs button .c{color:var(--dimmer);margin-left:5px;font-variant-numeric:tabular-nums}
+
+  .risk{border-left:3px solid var(--line);padding:11px 14px;margin-bottom:10px;
+        background:var(--panel);border-radius:0 8px 8px 0}
+  .risk.crit{border-left-color:var(--crit)} .risk.high{border-left-color:var(--bad)}
+  .risk.med{border-left-color:var(--warn)} .risk.low{border-left-color:var(--ok)}
+  .risk h5{margin:0 0 5px;font-size:14px} .risk p{margin:5px 0;color:var(--dim)}
+  .risk .do{color:var(--fg)} .risk .do b{color:var(--accent)}
+
+  #loader{position:fixed;inset:0;background:var(--bg);display:flex;align-items:center;
+          justify-content:center;flex-direction:column;gap:16px;z-index:100;padding:30px}
+  #drop{border:2px dashed var(--line);border-radius:13px;padding:44px 60px;text-align:center;
+        max-width:640px;cursor:pointer}
+  #drop.hot{border-color:var(--accent);background:var(--panel)}
+  #prog{width:min(560px,90vw);height:7px;background:var(--panel2);border-radius:4px;overflow:hidden;display:none}
+  #prog>i{display:block;height:100%;width:0;background:var(--accent);transition:width .12s}
+  #stat{color:var(--dim);font-size:13px;min-height:19px}
+  button.act{background:var(--panel2);border:1px solid var(--line);color:var(--fg);
+             border-radius:7px;padding:7px 13px;cursor:pointer;font-size:12.5px}
+  button.act:hover{border-color:var(--accent)}
+
+  /* ---- drill-down drawer ---- */
+  #drawer{position:fixed;left:0;right:0;bottom:0;height:74vh;background:var(--panel);
+          border-top:1px solid var(--accent);z-index:60;display:none;
+          grid-template-rows:auto auto auto 1fr;box-shadow:0 -18px 44px #0009}
+  #drawer.open{display:grid}
+  .dhead{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;
+         padding:12px 16px;border-bottom:1px solid var(--line)}
+  #dTitle{font-size:15px;font-weight:650}
+  #dMeta{color:var(--dim);font-size:12.5px;margin-top:3px}
+  #dCols{display:flex;gap:8px;padding:10px 16px;overflow-x:auto;border-bottom:1px solid var(--line)}
+  .colf{display:flex;flex-direction:column;gap:3px;flex:0 0 auto}
+  .colf span{font-size:10.5px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em}
+  .colf input{background:var(--bg);border:1px solid var(--line);border-radius:6px;
+              color:var(--fg);padding:5px 8px;font-size:12.5px;width:132px;
+              font-family:ui-monospace,Menlo,Consolas,monospace}
+  .colf input:focus{outline:none;border-color:var(--accent)}
+  .dtools{display:flex;align-items:center;gap:7px;padding:9px 16px;
+          border-bottom:1px solid var(--line);flex-wrap:wrap;font-size:12.5px;color:var(--dim)}
+  .dtools button:disabled{opacity:.35;cursor:default}
+  #dPer{background:var(--panel2);border:1px solid var(--line);color:var(--fg);
+        border-radius:7px;padding:7px 9px;font-size:12.5px}
+  #dRows{overflow:auto;padding:0 6px 30px}
+  #dRows table{font-size:12.5px}
+  #dRows th{background:var(--panel);z-index:1}
+  #dRows td.mono{font-family:ui-monospace,Menlo,Consolas,monospace}
+  #dRows td.nowrap{white-space:nowrap}
+  #dRows td.trunc{max-width:400px}
+  [data-f]{cursor:pointer}
+  [data-f]:hover{outline:1px solid var(--accent);outline-offset:2px;border-radius:6px}
+  .kpi[data-f]:hover .val{color:var(--accent)}
+  tbody tr[data-f]:hover{background:#1e2a3a}
+
+  @media print{
+    #drawer{display:none!important}
+    nav,#loader,button.act{display:none!important}
+    body{background:#fff;color:#000} section{display:block!important;page-break-before:always}
+    .card,.kpi,.risk{border-color:#ccc;background:#fff}
+  }
+</style>
+</head>
+<body>
+
+<div id="loader">
+  <div id="drop">
+    <div style="font-size:17px;font-weight:600;margin-bottom:8px">Drop your log files here</div>
+    <div style="color:var(--dim);font-size:13px">
+      Raw <b>nginx</b> or <b>Apache</b> logs, <code>access.log</code>, <code>error.log</code>,
+      or a converted <code>logs.csv</code>. No conversion step needed.<br>
+      Drop several at once and they are merged in timestamp order.<br>
+      <span style="color:var(--dimmer)">
+        Recognised: nginx <code>main</code>, <code>combined</code>, <code>common/CLF</code>,
+        nginx error, Apache error. Lines matching none of them are skipped and reported.<br>
+        Served from a local web server, <code>logs.csv</code> loads automatically,
+        <code>python -m http.server 8000</code> inside <code>logs/</code>.
+      </span>
+    </div>
+  </div>
+  <div id="prog"><i></i></div>
+  <div id="stat"></div>
+  <input type="file" id="file" accept=".csv,.log,.txt,text/plain" multiple hidden>
+</div>
+
+<div id="drawer">
+  <div class="dhead">
+    <div>
+      <div id="dTitle">Rows</div>
+      <div id="dMeta"></div>
+    </div>
+    <button class="act" id="dClose">Close ✕</button>
+  </div>
+  <div id="dCols"></div>
+  <div class="dtools">
+    <button class="act" id="dClear">Clear column filters</button>
+    <button class="act" id="dSort">Newest first</button>
+    <select class="act" id="dPer">
+      <option value="50">50 / page</option>
+      <option value="100" selected>100 / page</option>
+      <option value="250">250 / page</option>
+      <option value="1000">1000 / page</option>
+    </select>
+    <button class="act" id="dCsv">Export selection as CSV</button>
+    <span style="flex:1"></span>
+    <span id="dPager"></span>
+    <button class="act" id="dFirst">« first</button>
+    <button class="act" id="dPrev">‹ prev</button>
+    <button class="act" id="dNext">next ›</button>
+    <button class="act" id="dLast">last »</button>
+  </div>
+  <div id="dRows"></div>
+</div>
+
+<header>
+  <h1>Log explorer: Infrastructure &amp; Security Log Report</h1>
+  <div class="sub" id="hdr">nginx access, error and scanner logs · all hosted services</div>
+</header>
+
+<nav id="nav"></nav>
+<main id="main"></main>
+
+<script>
+"use strict";
+
+/* ------------------------------------------------------------------ helpers */
+const $ = s => document.querySelector(s);
+const el = (t, c, h) => { const n = document.createElement(t); if (c) n.className = c;
+                          if (h != null) n.innerHTML = h; return n; };
+const fmt = n => (n == null || isNaN(n)) ? "—" : n.toLocaleString("en-US");
+const pct = (a, b) => b ? (100 * a / b).toFixed(a / b < 0.01 ? 2 : 1) + "%" : "0%";
+const plural = (n, one, many) => fmt(n) + " " + (n === 1 ? one : (many || one + "s"));
+const esc = s => String(s == null ? "" : s)
+  .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+const bytes = n => {
+  if (!n) return "0 B";
+  const u = ["B","KB","MB","GB","TB"]; let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return n.toFixed(i ? 1 : 0) + " " + u[i];
+};
+
+/* Bounded counter. Distinct paths and IPs run into the hundreds of thousands;
+   pruning to the top `keep` once the map exceeds `cap` keeps memory flat. The
+   long tail it discards is by definition never in a top-N table. */
+class Counter {
+  constructor(cap = 60000, keep = 4000) { this.m = new Map(); this.cap = cap; this.keep = keep; this.pruned = 0; }
+  add(k, n = 1) {
+    if (k == null || k === "") return;
+    this.m.set(k, (this.m.get(k) || 0) + n);
+    if (this.m.size > this.cap) this.prune();
+  }
+  prune() {
+    const top = [...this.m.entries()].sort((a, b) => b[1] - a[1]).slice(0, this.keep);
+    this.pruned += this.m.size - top.length;
+    this.m = new Map(top);
+  }
+  top(n = 20) { return [...this.m.entries()].sort((a, b) => b[1] - a[1]).slice(0, n); }
+  get(k) { return this.m.get(k) || 0; }
+  get size() { return this.m.size; }
+}
+
+/* ------------------------------------------------------------- CSV decoding */
+/* The converter never emits a newline inside a quoted field, so splitting the
+   stream on \n is safe. Fields DO contain commas and escaped quotes, so each
+   line is walked with a small state machine rather than String.split(","). */
+function parseLine(s) {
+  const out = []; let i = 0, n = s.length;
+  while (i <= n) {
+    let v = "";
+    if (s[i] === '"') {
+      i++;
+      while (i < n) {
+        if (s[i] === '"') { if (s[i+1] === '"') { v += '"'; i += 2; } else { i++; break; } }
+        else v += s[i++];
+      }
+    } else {
+      const j = s.indexOf(",", i);
+      v = j < 0 ? s.slice(i) : s.slice(i, j);
+      i = j < 0 ? n : j;
+    }
+    out.push(v);
+    if (i >= n) break;
+    if (s[i] === ",") i++; else break;
+  }
+  return out;
+}
+
+const C = { TS:0, SRC:1, LEVEL:2, HOST:3, CLIENT:4, EDGE:5, METHOD:6, PATH:7, QUERY:8,
+            PROTO:9, STATUS:10, BYTES:11, REFERER:12, UA:13, UACLASS:14, OWASP:15,
+            SIGNAL:16, ERRMSG:17, FILE:18 };
+
+/* ==========================================================================
+   RAW LOG READING, nginx and Apache, no CSV step
+
+   The page accepts raw .log files as well as logs.csv. A raw line is parsed
+   into exactly the same 19-field array the CSV produces, so everything
+   downstream, aggregates, OWASP classification, drill-down, is unchanged and
+   cannot drift between the two input paths.
+
+   These rules are a deliberate port of scripts/logs/logparse.go. The Go tool
+   remains the way to process very large corpora (it streams and never holds
+   rows); this exists so a single log can be dropped straight onto the page.
+   IF YOU CHANGE A RULE IN ONE, CHANGE IT IN THE OTHER, a signal that fires in
+   the converter but not here would make the same log produce two different
+   reports depending on how it was loaded.
+   ========================================================================== */
+
+const LF = { UNKNOWN:0, NGINX_MAIN:1, COMBINED:2, COMMON:3, NGINX_ERR:4, APACHE_ERR:5, CSV:6 };
+const LF_NAME = ["unknown","nginx-main","combined","common/CLF","nginx-error","apache-error","csv"];
+
+const MONTHS = { Jan:0,Feb:1,Mar:2,Apr:3,May:4,Jun:5,Jul:6,Aug:7,Sep:8,Oct:9,Nov:10,Dec:11 };
+
+/* Splits a log tail into quoted strings and bare words. nginx escapes an inner
+   quote as \x22, but the backslash form is handled too so a differently
+   configured log cannot shift every following column by one. */
+function tokenizeLog(s) {
+  const out = [];
+  for (let i = 0; i < s.length;) {
+    const c = s[i];
+    if (c === " " || c === "\t") { i++; continue; }
+    if (c === '"') {
+      let v = ""; i++;
+      while (i < s.length && s[i] !== '"') {
+        if (s[i] === "\\" && i + 1 < s.length) i++;
+        v += s[i++];
+      }
+      i++;
+      out.push({ v, q:true });
+    } else {
+      let j = i;
+      while (j < s.length && s[j] !== " " && s[j] !== "\t") j++;
+      out.push({ v:s.slice(i, j), q:false });
+      i = j;
+    }
+  }
+  return out;
+}
+
+// "15/Aug/2026:00:49:34 +0000"
+function parseAccessTime(s) {
+  const m = /^(\d{2})\/(\w{3})\/(\d{4}):(\d{2}):(\d{2}):(\d{2})\s*([+-]\d{4})?$/.exec(s.trim());
+  if (!m || MONTHS[m[2]] === undefined) return null;
+  let ms = Date.UTC(+m[3], MONTHS[m[2]], +m[1], +m[4], +m[5], +m[6]);
+  if (m[7]) {
+    const sign = m[7][0] === "-" ? 1 : -1;
+    ms += sign * ((+m[7].slice(1, 3)) * 3600 + (+m[7].slice(3, 5)) * 60) * 1000;
+  }
+  return new Date(ms);
+}
+const isoOf = d => d.toISOString().replace(/\.\d{3}Z$/, "Z");
+
+function sniffLine(line) {
+  if (/^\[[A-Z][a-z]{2} [A-Z][a-z]{2} [ 0-9]\d /.test(line)) return LF.APACHE_ERR;
+  if (/^\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2} .*\[/.test(line)) return LF.NGINX_ERR;
+  const lb = line.indexOf("["), rb = line.indexOf("]");
+  if (lb < 0 || rb < lb) return LF.UNKNOWN;
+  if (!parseAccessTime(line.slice(lb + 1, rb))) return LF.UNKNOWN;
+  const t = tokenizeLog(line.slice(rb + 1));
+  if (t.length >= 7 && t[0].q && t[1].q && !t[2].q) return LF.NGINX_MAIN;
+  if (t.length >= 5 && t[0].q && !t[1].q && t[3] && t[3].q) return LF.COMBINED;
+  if (t.length >= 3 && t[0].q && !t[1].q) return LF.COMMON;
+  return LF.UNKNOWN;
+}
+
+const blank = () => ["","","","","","","","","","","","","","","","","","",""];
+
+function splitRequestJs(req) {
+  if (!req || req === "-") return ["", "", "", ""];
+  const p = req.split(/\s+/).filter(Boolean);
+  if (!p.length) return ["", "", "", ""];
+  let method = "", path = "", proto = "";
+  if (p.length === 1) path = p[0];
+  else if (p.length === 2) { method = p[0]; path = p[1]; }
+  else {
+    method = p[0];
+    // The URL may contain unencoded spaces, `?id=1 union select 1,2` is the
+    // textbook case. Taking p[1] alone discards the payload and the injection
+    // never classifies.
+    if (p[p.length - 1].startsWith("HTTP/")) { proto = p[p.length - 1]; path = p.slice(1, -1).join(" "); }
+    else path = p.slice(1).join(" ");
+  }
+  let query = "";
+  const qi = path.indexOf("?");
+  if (qi >= 0) { query = path.slice(qi + 1); path = path.slice(0, qi); }
+  return [method, path, query, proto];
+}
+
+const dashJs = s => (s === "-" ? "" : (s || ""));
+
+function parseAccessRaw(line) {
+  const lb = line.indexOf("["), rb = line.indexOf("]");
+  if (lb < 0 || rb < lb) return { reason:"no [timestamp] field" };
+  const t = parseAccessTime(line.slice(lb + 1, rb));
+  if (!t) return { reason:"unparsable timestamp" };
+
+  const f = blank();
+  f[C.TS] = isoOf(t);
+  f[C.SRC] = "access";
+  const head = line.slice(0, lb).trim().split(/\s+/);
+  if (head[0]) f[C.EDGE] = head[0];
+
+  const tok = tokenizeLog(line.slice(rb + 1));
+  let request = "";
+  if (tok.length >= 7 && tok[0].q && tok[1].q && !tok[2].q) {
+    f[C.HOST] = dashJs(tok[0].v); request = tok[1].v;
+    f[C.STATUS] = tok[2].v; f[C.BYTES] = tok[3].v;
+    f[C.REFERER] = dashJs(tok[4].v); f[C.UA] = dashJs(tok[5].v);
+    f[C.CLIENT] = dashJs(tok[6].v).split(",")[0].trim();
+  } else if (tok.length >= 5 && tok[0].q && !tok[1].q && tok[3] && tok[3].q) {
+    request = tok[0].v; f[C.STATUS] = tok[1].v; f[C.BYTES] = tok[2].v;
+    f[C.REFERER] = dashJs(tok[3].v); f[C.UA] = dashJs(tok[4].v);
+  } else if (tok.length >= 3 && tok[0].q && !tok[1].q) {
+    request = tok[0].v; f[C.STATUS] = tok[1].v; f[C.BYTES] = tok[2].v;
+  } else {
+    return { reason:"no recognisable request/status fields" };
+  }
+  if (!f[C.CLIENT]) f[C.CLIENT] = f[C.EDGE];
+  if (f[C.BYTES] === "-") f[C.BYTES] = "0";
+
+  const [m, p, q, pr] = splitRequestJs(request);
+  f[C.METHOD] = m; f[C.PATH] = p; f[C.QUERY] = q; f[C.PROTO] = pr;
+  f[C.UACLASS] = classifyUAJs(f[C.UA]);
+  const [ow, sig] = classifyJs(m, p, q, f[C.UA], f[C.HOST]);
+  f[C.OWASP] = ow; f[C.SIGNAL] = sig;
+  return { f };
+}
+
+function parseNginxErrRaw(line, prevTS) {
+  const f = blank();
+  f[C.SRC] = "error"; f[C.UACLASS] = "empty"; f[C.OWASP] = "-";
+  // nginx prints a startup failure twice: once timestamped, once as a bare
+  // `nginx: [emerg] ...`. Both carry the level so the count matches a grep.
+  if (line.startsWith("nginx: [")) {
+    const rb = line.indexOf("]");
+    if (rb > 8) {
+      f[C.TS] = prevTS || ""; f[C.LEVEL] = line.slice(8, rb);
+      f[C.ERRMSG] = line.slice(rb + 1).trim();
+      return f[C.TS] ? { f } : { reason:"leading nginx: line with no prior timestamp" };
+    }
+  }
+  const m = /^(\d{4})\/(\d{2})\/(\d{2}) (\d{2}):(\d{2}):(\d{2})/.exec(line);
+  if (!m) {
+    // Continuation lines (PHP stack traces) belong to the previous entry.
+    if (!prevTS) return { reason:"error continuation with no prior entry" };
+    f[C.TS] = prevTS; f[C.LEVEL] = "(cont)"; f[C.ERRMSG] = line.trim();
+    return { f };
+  }
+  f[C.TS] = isoOf(new Date(Date.UTC(+m[1], +m[2]-1, +m[3], +m[4], +m[5], +m[6])));
+  let rest = line.slice(m[0].length);
+  const lb = rest.indexOf("[");
+  if (lb >= 0) {
+    const e = rest.indexOf("]", lb);
+    if (e > lb) { f[C.LEVEL] = rest.slice(lb + 1, e); rest = rest.slice(e + 1); }
+  }
+  let msg = rest;
+  for (const k of [", client: ", ", while ", ", server: "]) {
+    const i = msg.indexOf(k); if (i >= 0) msg = msg.slice(0, i);
+  }
+  f[C.ERRMSG] = msg.trim().replace(/^[\d#*:\s]+/, "");
+  const fld = (key) => {
+    const i = rest.indexOf(key); if (i < 0) return "";
+    let v = rest.slice(i + key.length);
+    if (v.startsWith('"')) { const j = v.indexOf('"', 1); if (j > 0) return v.slice(1, j); }
+    const j = v.indexOf(", "); return (j >= 0 ? v.slice(0, j) : v).trim();
+  };
+  f[C.EDGE] = fld("client: "); f[C.CLIENT] = f[C.EDGE];
+  f[C.HOST] = dashJs(fld("host: ").replace(/"/g, "")) || fld("server: ");
+  const [m2, p2, q2, pr2] = splitRequestJs(fld("request: ").replace(/"/g, ""));
+  f[C.METHOD] = m2; f[C.PATH] = p2; f[C.QUERY] = q2; f[C.PROTO] = pr2;
+  const [ow, sig] = classifyJs(m2, p2, q2, "", f[C.HOST]);
+  f[C.OWASP] = ow; f[C.SIGNAL] = sig;
+  return { f };
+}
+
+// [Thu Aug 14 22:52:45.123456 2026] [core:error] [pid 8] [client 1.2.3.4:52] msg
+function parseApacheErrRaw(line) {
+  const rb = line.indexOf("]");
+  if (!line.startsWith("[") || rb < 0) return { reason:"apache error: no [timestamp]" };
+  const m = /^(\w{3}) (\w{3}) ([ 0-9]\d) (\d{2}):(\d{2}):(\d{2})(?:\.\d+)? (\d{4})$/.exec(line.slice(1, rb));
+  if (!m || MONTHS[m[2]] === undefined) return { reason:"apache error: unparsable timestamp" };
+  const f = blank();
+  f[C.SRC] = "error"; f[C.UACLASS] = "empty"; f[C.OWASP] = "-";
+  f[C.TS] = isoOf(new Date(Date.UTC(+m[7], MONTHS[m[2]], +m[3], +m[4], +m[5], +m[6])));
+  let rest = line.slice(rb + 1);
+  const lb = rest.indexOf("[");
+  if (lb >= 0) {
+    const e = rest.indexOf("]", lb);
+    if (e > lb) {
+      let lvl = rest.slice(lb + 1, e);
+      const c = lvl.indexOf(":"); if (c >= 0) lvl = lvl.slice(c + 1);
+      f[C.LEVEL] = lvl; rest = rest.slice(e + 1);
+    }
+  }
+  const ci = rest.indexOf("[client ");
+  if (ci >= 0) {
+    const e = rest.indexOf("]", ci);
+    if (e > ci) {
+      let c = rest.slice(ci + 8, e);
+      // Strip the source port; keeping it splits one attacker into hundreds.
+      const p = c.lastIndexOf(":");
+      if (p > 0 && c.slice(0, p).indexOf(":") < 0) c = c.slice(0, p);
+      f[C.CLIENT] = c; f[C.EDGE] = c;
+    }
+  }
+  while (rest.trim().startsWith("[")) {
+    rest = rest.trim();
+    const e = rest.indexOf("]"); if (e < 0) break;
+    rest = rest.slice(e + 1);
+  }
+  f[C.ERRMSG] = rest.trim();
+  return { f };
+}
+
+/* ---- classification, ported from logparse.go ---- */
+const AI_UAS = ["gptbot","oai-searchbot","chatgpt-user","claudebot","claude-web","claude-searchbot",
+  "claude-user","anthropic-ai","perplexitybot","perplexity-user","ccbot","google-extended",
+  "bytespider","meta-externalagent","amazonbot","applebot-extended","cohere-ai","diffbot",
+  "imagesiftbot","timpibot","youbot","omgili"];
+const SEARCH_UAS = ["googlebot","storebot-google","google-inspectiontool","adsbot-google",
+  "mediapartners-google","feedfetcher-google","bingbot","bingpreview","msnbot","slurp","duckduckbot",
+  "duckassistbot","baiduspider","yandex","sogou","exabot","applebot","petalbot","seznambot",
+  "facebookexternalhit","twitterbot","linkedinbot","pinterest","whatsapp","telegrambot","discordbot","slackbot"];
+const SCANNER_UAS = ["nikto","sqlmap","nmap","masscan","zgrab","nuclei","wpscan","dirbuster","gobuster",
+  "fuzz","acunetix","netsparker","qualys","censys","shodan","paloaltonetworks","palo alto networks",
+  "internet-measurement","scans in","research scan","securityscan","expanse","l9explore","zmap","odin","criminalip"];
+const TOOL_UAS = ["curl/","wget","python-requests","python-urllib","go-http-client","java/","libwww",
+  "okhttp","axios","postmanruntime","httpclient","lwp::","guzzle","restsharp","aiohttp","node-fetch","powershell"];
+const BOT_HINTS = ["bot","spider","crawler","scan","http","fetch","monitor"];
+const hasAny = (s, arr) => arr.some(x => s.includes(x));
+
+function classifyUAJs(ua) {
+  if (!ua) return "empty";
+  const l = ua.toLowerCase();
+  if (hasAny(l, AI_UAS)) return "ai-crawler";
+  if (hasAny(l, SEARCH_UAS)) return "search-crawler";
+  if (hasAny(l, SCANNER_UAS)) return "scanner";
+  if (hasAny(l, TOOL_UAS)) return "tool";
+  if (hasAny(l, BOT_HINTS)) return "bot";
+  return l.startsWith("mozilla/") ? "browser" : "bot";
+}
+
+// Order matters: first match wins, so specific rules precede broad ones.
+const RULES = [
+  ["A03","sqli",["union select","union+select","union%20select","or 1=1","or+1=1","' or ","information_schema","sleep(","benchmark(","waitfor delay","pg_sleep","@@version","concat(0x","/**/","xp_cmdshell"]],
+  ["A03","xss",["<script","%3cscript","onerror=","onload=","javascript:","alert(","document.cookie","<img src=x","%3cimg"]],
+  ["A03","lfi-rfi",["php://","data://","expect://","file://","zip://","/etc/passwd","/proc/self/environ","c:\\windows","win.ini","..%2f","..%5c"]],
+  ["A03","cmd-injection",[";wget","|wget",";curl","|curl","$(","%24%28","`id`",";cat+/","/bin/sh","/bin/bash","system(","shell_exec","passthru("]],
+  ["A06","log4shell",["${jndi:","jndi:ldap","jndi%3aldap","%24%7bjndi"]],
+  ["A06","phpunit-rce",["phpunit","eval-stdin.php"]],
+  ["A06","wp-plugin-probe",["/wp-content/plugins/","/wp-content/themes/","/wp-includes/","/wp-json/","wp-file-manager","revslider","duplicator"]],
+  ["A06","known-cve-path",["/cgi-bin/","/boaform/","/solr/","/struts","/actuator","/hudson","/jenkins","/telerik","/owa/auth","/autodiscover/","/nacos/","/druid/","/geoserver","/_ignition/","/thinkphp","/elfinder","/zabbix","/grafana","/api/jsonws","/hnap1","/gponform","/mifs/","/ecp/","/ews/","/vpn/","/remote/fgt_lang","/+cscoe+"]],
+  ["A10","cloud-metadata",["169.254.169.254","metadata.google","/latest/meta-data"]],
+  ["A10","open-redirect-ssrf",["url=http","uri=http","next=http","redirect=http","dest=http","target=http","return=http","continue=http","u=http","callback=http","proxy=http","feed=http","image_url=http"]],
+  ["A02","secret-file",[".env","id_rsa",".pem",".ppk",".key","credentials",".npmrc",".aws/",".ssh/","secrets.",".htpasswd","web.config",".git-credentials"]],
+  ["A02","backup-dump",[".sql",".bak",".old",".swp","~","backup.zip","backup.tar","dump.",".tar.gz",".7z",".rar","database.zip","www.zip"]],
+  ["A08","webshell",["shell.php","alfa.php","wso.php","c99.php","r57.php","adminfuns","wp_filemanager","filemanager.php","upload.php","cmd.php","indoxploit","marijuana","mini.php","byp.php","moon.php","0x.php","xmrlpc.php"]],
+  ["A08","file-upload-attempt",["/upload","fileupload","?file=","&file="]],
+  ["A07","cms-login",["wp-login.php","xmlrpc.php","/user/login","/administrator/"]],
+  ["A07","admin-panel-exposed",["/portainer","/phpldapadmin","/postfixadmin","/snappymail","/roundcube","/webmail","/self-service-password","/mailadmin","/cpanel","/whm","/plesk","/webadmin","/adminer"]],
+  ["A01","path-traversal",["../","..\\","%2e%2e","%252e","....//"]],
+  ["A01","vcs-exposure",["/.git","/.svn","/.hg","/.bzr","/.ds_store"]],
+  ["A01","admin-path",["/admin","/manage","/phpmyadmin","/pma","/myadmin","/dbadmin","/server-status","/server-info","/.well-known/security","/console"]],
+  ["A01","config-exposure",["config.php","configuration.php","wp-config","settings.py","application.properties","docker-compose","dockerfile","/debug"]],
+  ["A05","server-probe",["/crossdomain.xml","/clientaccesspolicy.xml","/server-info"]],
+  // Last on purpose: `${` and `{{` are the broadest patterns here and would
+  // otherwise swallow Log4Shell, which is far more specific and more serious.
+  ["A03","template-injection",["{{","%7b%7b","${","%24%7b","<%=","#{"]],
+];
+const STATIC_EXTS = [".js",".mjs",".css",".map",".png",".jpg",".jpeg",".gif",".webp",".avif",".svg",
+  ".ico",".bmp",".woff",".woff2",".ttf",".otf",".eot",".mp4",".webm",".mp3",".ogg",".pdf"];
+const UNSAFE_METHODS = ["PROPFIND","TRACE","TRACK","DEBUG","PATCH","PUT","DELETE","CONNECT","MOVE","COPY","MKCOL","SEARCH"];
+// Mirrors isIP() in logparse.go. "apps.example.com:443" is a NAME with a port,
+// not an address, matching on any colon filed ordinary vhost traffic as host
+// header abuse. IPv6 is hex digits and colons only.
+const looksIP = h => !!h && (/^\d{1,3}(\.\d{1,3}){3}$/.test(h) ||
+                             (h.includes(":") && /^[0-9a-f:]+$/i.test(h)));
+
+function classifyJs(method, path, query, ua, host) {
+  if (method && UNSAFE_METHODS.includes(method.toUpperCase()))
+    return ["A05", "unsafe-method-" + method.toLowerCase()];
+  if (host && (host.startsWith("_dc-mx.") || looksIP(host))) return ["A05", "host-header-misuse"];
+  let subject = (path || "").toLowerCase();
+  if (query) subject += "?" + query.toLowerCase();
+  if (!subject) return ["-", ""];
+  // Static assets are never the attack: SnappyMail's own openpgp.min.js sits
+  // under /snappymail/, and an admin-panel rule matched it thousands of times.
+  if (!query) {
+    const d = subject.lastIndexOf(".");
+    if (d >= 0 && STATIC_EXTS.includes(subject.slice(d))) return ["-", ""];
+  }
+  for (const [ow, sig, pats] of RULES)
+    for (const p of pats) if (subject.includes(p)) return [ow, sig];
+  if (ua && classifyUAJs(ua) === "scanner") return ["A04", "automated-scanner"];
+  return ["-", ""];
+}
+
+/* Parses one raw line into the CSV field array, or reports why it cannot.
+
+   `inErrorLog` gates the continuation fallback. A stack-trace line in an error
+   log belongs to the previous entry and must be kept; the identical-looking
+   "Starting periodic command scheduler: cron." in an ACCESS log is container
+   chatter and must be dropped. Without the gate the access log's 48 cron lines
+   were absorbed as error continuations and inflated the error count. */
+function parseRawLine(line, prevTS, inErrorLog) {
+  const g = sniffLine(line);
+  switch (g) {
+    case LF.APACHE_ERR: return parseApacheErrRaw(line);
+    case LF.NGINX_ERR:  return parseNginxErrRaw(line, prevTS);
+    case LF.NGINX_MAIN:
+    case LF.COMBINED:
+    case LF.COMMON:     return parseAccessRaw(line);
+  }
+  if (inErrorLog && prevTS && line.trim()) return parseNginxErrRaw(line, prevTS);
+  return { reason:"no recognisable log format" };
+}
+
+/* ------------------------------------------------------- columnar row store
+   Drill-down needs the rows back, and the aggregator deliberately throws them
+   away. Keeping 900k rows as objects would cost well over a gigabyte, so they
+   go into parallel typed-array columns with every repeated string held once in
+   a dictionary and referenced by integer.
+
+   Hosts, methods, statuses, agents and signals repeat endlessly across the
+   corpus; paths and IPs repeat less but still enough to pay for themselves.
+   The result is roughly 110 MB for the full 200 MB CSV, and a filter over all
+   901,647 rows is an integer scan that finishes in a few milliseconds. */
+class Col {
+  constructor(T) { this.T = T; this.a = new T(1 << 16); this.n = 0; }
+  push(v) {
+    if (this.n === this.a.length) { const b = new this.T(this.a.length * 2); b.set(this.a); this.a = b; }
+    this.a[this.n++] = v;
+  }
+}
+class Dict {
+  constructor() { this.m = new Map(); this.a = []; }
+  id(s) {
+    s = s == null ? "" : s;
+    let i = this.m.get(s);
+    if (i === undefined) { i = this.a.length; this.a.push(s); this.m.set(s, i); }
+    return i;
+  }
+  str(i) { return this.a[i] === undefined ? "" : this.a[i]; }
+  /* Flags every dictionary entry satisfying `pred`, so a substring filter costs
+     one pass over the distinct values rather than one per row. */
+  mask(pred) {
+    const m = new Uint8Array(this.a.length);
+    for (let i = 0; i < this.a.length; i++) if (pred(this.a[i])) m[i] = 1;
+    return m;
+  }
+}
+
+const S = {
+  n:0, cap:4_000_000, overflow:false,
+  ts:new Col(Float64Array), status:new Col(Uint16Array), bytes:new Col(Float64Array),
+  host:new Col(Int32Array), client:new Col(Int32Array), edge:new Col(Int32Array),
+  method:new Col(Int32Array), path:new Col(Int32Array), query:new Col(Int32Array),
+  ua:new Col(Int32Array), referer:new Col(Int32Array), errmsg:new Col(Int32Array),
+  src:new Col(Uint8Array), level:new Col(Int32Array),
+  uaClass:new Col(Int32Array), owasp:new Col(Int32Array), signal:new Col(Int32Array),
+  dHost:new Dict(), dClient:new Dict(), dEdge:new Dict(), dMethod:new Dict(),
+  dPath:new Dict(), dQuery:new Dict(), dUA:new Dict(), dRef:new Dict(),
+  dErr:new Dict(), dLevel:new Dict(), dUAClass:new Dict(), dOwasp:new Dict(),
+  dSignal:new Dict(), dFile:new Dict(),
+  file:new Col(Int32Array),
+};
+const SRC_ID = { access:0, error:1, scanners:2 };
+const SRC_NAME = ["access", "error", "scanners"];
+
+function store(f, tsMs) {
+  // Hard stop rather than an out-of-memory tab. Aggregates stay correct either
+  // way; only the row-level drill-down is lost, and the page says so.
+  if (S.n >= S.cap) { S.overflow = true; return; }
+  S.ts.push(tsMs);
+  S.status.push(+f[C.STATUS] || 0);
+  // -1, not 0, when the field is absent. An error-log row has no byte count at
+  // all, and folding that into "0 bytes" made the empty-body filter return 813
+  // rows where the counter had found 361, a missing measurement is not a
+  // measurement of zero.
+  S.bytes.push(f[C.BYTES] === "" || f[C.BYTES] === undefined ? -1 : (+f[C.BYTES] || 0));
+  S.host.push(S.dHost.id(f[C.HOST]));
+  S.client.push(S.dClient.id(f[C.CLIENT]));
+  S.edge.push(S.dEdge.id(f[C.EDGE]));
+  S.method.push(S.dMethod.id(f[C.METHOD]));
+  S.path.push(S.dPath.id(f[C.PATH]));
+  S.query.push(S.dQuery.id(f[C.QUERY]));
+  S.ua.push(S.dUA.id(f[C.UA]));
+  S.referer.push(S.dRef.id(f[C.REFERER]));
+  S.errmsg.push(S.dErr.id(f[C.ERRMSG]));
+  S.src.push(SRC_ID[f[C.SRC]] === undefined ? 0 : SRC_ID[f[C.SRC]]);
+  S.level.push(S.dLevel.id(f[C.LEVEL]));
+  S.uaClass.push(S.dUAClass.id(f[C.UACLASS]));
+  S.owasp.push(S.dOwasp.id(f[C.OWASP]));
+  S.signal.push(S.dSignal.id(f[C.SIGNAL]));
+  // Older CSVs have no file column; treat its absence as "unknown source file"
+  // rather than letting undefined propagate into the dictionary.
+  S.file.push(S.dFile.id(f[C.FILE] || "(unknown)"));
+  S.n++;
+}
+
+const OWASP_NAMES = {
+  A01:"Broken Access Control", A02:"Cryptographic Failures", A03:"Injection",
+  A04:"Insecure Design", A05:"Security Misconfiguration",
+  A06:"Vulnerable &amp; Outdated Components", A07:"Identification &amp; Auth Failures",
+  A08:"Software &amp; Data Integrity Failures", A09:"Security Logging &amp; Monitoring Failures",
+  A10:"Server-Side Request Forgery"
+};
+
+/* --------------------------------------------------------------- aggregator */
+const A = {
+  rows:0, access:0, error:0, scanners:0, requests:0,
+  bytes:0, tsMin:null, tsMax:null,
+  status:new Counter(2000,2000), klass:{1:0,2:0,3:0,4:0,5:0,0:0},
+  host:new Counter(5000,5000), hostBytes:new Counter(5000,5000),
+  hostErr:new Counter(5000,5000),
+  ua:new Counter(), uaClass:new Counter(60,60), method:new Counter(200,200),
+  path:new Counter(), referer:new Counter(), client:new Counter(),
+  p404:new Counter(), p502host:new Counter(5000,5000),
+  day:new Counter(400,400), dayErr:new Counter(400,400), dayAtk:new Counter(400,400),
+  hourOfDay:new Array(24).fill(0),
+  dayBot:new Counter(400,400), dayHuman:new Counter(400,400),
+  crawlerDay:new Counter(400,400), crawlerStatus:new Counter(2000,2000),
+  crawler404:new Counter(), aiAgent:new Counter(200,200), aiPath:new Counter(),
+  owasp:new Counter(30,30), signal:new Counter(400,400),
+  owaspBlocked:new Counter(30,30), owaspServed:new Counter(30,30),
+  owaspDay:{},                       // A01..A10 -> Counter(day)
+  sigDetail:new Map(),               // signal -> {owasp,count,blocked,served,ips:Counter,paths:Counter,hosts:Counter,samples:[]}
+  attacker:new Map(),                // ip -> {n,sigs:Set,hosts:Set,first,last,blocked,owasp:Set}
+  errLevel:new Counter(30,30), errMsg:new Counter(),
+  uniqueClients:new Set(), uniqueCap:400000,
+  // Per-host body-size census of 200 responses, used to detect catch-all pages.
+  // See softKeys(), without this the report calls a WordPress soft-404 an
+  // exposed .env file, which is the worst mistake it could make.
+  hostSize:new Counter(200000,150000), host200:new Counter(5000,5000),
+  hostPathsAtSize:new Map(), emptyBody:new Counter(20000,2000), emptyBodyN:0,
+  rejected:0, rejectReason:new Counter(200,200), rejectSamples:[],
+  emerg:[], statusByDay:new Map(),   // day -> {t,e5,e4}
+};
+
+function bump(o, k) { o[k] = (o[k] || 0) + 1; }
+
+function consume(f) {
+  if (f.length < 18) return;
+  A.rows++;
+
+  const src = f[C.SRC];
+  if (src === "access") A.access++; else if (src === "error") A.error++; else A.scanners++;
+
+  const ts = f[C.TS];
+  const day = ts.slice(0, 10);
+  store(f, Date.parse(ts));
+  if (!A.tsMin || ts < A.tsMin) A.tsMin = ts;
+  if (!A.tsMax || ts > A.tsMax) A.tsMax = ts;
+  const hh = +ts.slice(11, 13); if (hh >= 0 && hh < 24) A.hourOfDay[hh]++;
+
+  const host = f[C.HOST] || "(none)";
+  const status = f[C.STATUS];
+  const uaClass = f[C.UACLASS];
+  const owasp = f[C.OWASP];
+  const sig = f[C.SIGNAL];
+  const client = f[C.CLIENT];
+
+  A.day.add(day);
+  A.host.add(host);
+
+  if (src === "error") {
+    A.errLevel.add(f[C.LEVEL] || "(none)");
+    A.dayErr.add(day);
+    A.hostErr.add(host);
+    if (f[C.ERRMSG]) A.errMsg.add(f[C.ERRMSG].slice(0, 150));
+    if (f[C.LEVEL] === "emerg" && A.emerg.length < 60) A.emerg.push({ ts, host, msg: f[C.ERRMSG] });
+  } else {
+    // A handful of stdout lines are container chatter ("Starting periodic command
+    // scheduler: cron."), not requests. They carry no status, and counting them as
+    // traffic would inflate every rate on the page.
+    if (status) A.requests++;
+    const b = +f[C.BYTES] || 0;
+    A.bytes += b;
+    A.hostBytes.add(host, b);
+    A.status.add(status);
+    const k = status ? +status.charAt(0) : 0;
+    A.klass[k >= 1 && k <= 5 ? k : 0]++;
+
+    let st = A.statusByDay.get(day);
+    if (!st) { st = { t:0, e4:0, e5:0, r3:0 }; A.statusByDay.set(day, st); }
+    st.t++; if (k === 4) st.e4++; else if (k === 5) st.e5++; else if (k === 3) st.r3++;
+
+    A.method.add(f[C.METHOD] || "(none)");
+    A.path.add(f[C.PATH]);
+    A.uaClass.add(uaClass);
+    if (f[C.UA]) A.ua.add(f[C.UA].slice(0, 160));
+    if (f[C.REFERER]) A.referer.add(f[C.REFERER].slice(0, 160));
+    if (client) {
+      A.client.add(client);
+      if (!isInternalIP(client) && A.uniqueClients.size < A.uniqueCap) A.uniqueClients.add(client);
+    }
+    // Census covers every 2xx, not just 200. A scanner sending Range headers gets
+    // 206 Partial Content back, 216 such rows were being scored as genuine
+    // exposure purely because the census had ignored the status code.
+    if (status && status.charAt(0) === "2") {
+      const key = host + "|" + f[C.BYTES];
+      A.hostSize.add(key); A.host200.add(host);
+      let ps = A.hostPathsAtSize.get(key);
+      if (!ps) { if (A.hostPathsAtSize.size < 150000) A.hostPathsAtSize.set(key, ps = new Set()); }
+      // Capped: the set exists to prove "many distinct paths share this exact
+      // body", and 5,000 already proves it. Rendering says "5,000+" at the cap
+      // rather than presenting a truncated count as the real one.
+      if (ps && ps.size < 5000) ps.add(f[C.PATH]);
+      // A GET that returns 200 with no body at all is not a catch-all page, it
+      // is a broken response, and it gets its own finding.
+      // Only a plain 200, 204 and 304 are meant to be empty.
+      if (f[C.BYTES] === "0" && status === "200" && f[C.METHOD] === "GET") {
+        A.emptyBodyN++; A.emptyBody.add(host + " " + f[C.PATH]);
+      }
+    }
+    if (status === "404") A.p404.add(host + " " + f[C.PATH]);
+    if (k === 5) A.p502host.add(host + " " + status);
+
+    if (uaClass === "browser") A.dayHuman.add(day); else A.dayBot.add(day);
+    if (uaClass === "search-crawler") {
+      A.crawlerDay.add(day);
+      A.crawlerStatus.add(status);
+      if (status === "404") A.crawler404.add(f[C.PATH]);
+    }
+    if (uaClass === "ai-crawler") {
+      A.aiAgent.add(shortAgent(f[C.UA]));
+      A.aiPath.add(f[C.PATH]);
+    }
+  }
+
+  if (owasp && owasp !== "-") {
+    A.owasp.add(owasp);
+    A.signal.add(sig);
+    A.dayAtk.add(day);
+    if (!A.owaspDay[owasp]) A.owaspDay[owasp] = new Counter(400, 400);
+    A.owaspDay[owasp].add(day);
+
+    // "Blocked" is the control working; a 2xx on an attack path is an incident.
+    // Counting them together would hide the only distinction that matters here.
+    const blocked = status === "403" || status === "444" || status === "401" ||
+                    status === "301" || status === "302" || status === "404" || src === "error";
+    const is2xx = !!status && status.charAt(0) === "2";
+    if (blocked) A.owaspBlocked.add(owasp); else if (is2xx) A.owaspServed.add(owasp);
+
+    let d = A.sigDetail.get(sig);
+    if (!d) {
+      d = { owasp, count:0, blocked:0, served:0, ips:new Counter(20000,1500),
+            paths:new Counter(20000,1500), hosts:new Counter(500,500),
+            // Generous cap on purpose: this counter decides soft-404 vs genuine
+            // exposure, and pruning it silently discards soft hits, which shows
+            // up as phantom "reached real content" rows.
+            sizes:new Counter(150000,120000), samples:[] };
+      A.sigDetail.set(sig, d);
+    }
+    d.count++;
+    if (blocked) d.blocked++;
+    else if (is2xx) { d.served++; d.sizes.add(host + "|" + f[C.BYTES]); }
+    d.ips.add(client); d.paths.add(f[C.PATH] + (f[C.QUERY] ? "?" + f[C.QUERY] : "")); d.hosts.add(host);
+    if (d.samples.length < 6) {
+      d.samples.push({ ts, host, client, method:f[C.METHOD], path:f[C.PATH],
+                       query:f[C.QUERY], status, ua:f[C.UA], err:f[C.ERRMSG] });
+    }
+
+    // Loopback and RFC1918 addresses are the platform talking to itself, health
+    // checks and container-to-container calls that arrive with their own
+    // X-Forwarded-For. Ranking them as attackers put 127.0.0.1 at the top of the
+    // threat table with 23,967 "attempts", and a deny list built from that would
+    // have taken the site down.
+    if (client && !isInternalIP(client)) {
+      let a = A.attacker.get(client);
+      if (!a) {
+        if (A.attacker.size > 40000) pruneAttackers();
+        a = { n:0, sigs:new Set(), hosts:new Set(), owasp:new Set(), first:ts, last:ts, blocked:0 };
+        A.attacker.set(client, a);
+      }
+      a.n++; a.sigs.add(sig); a.owasp.add(owasp);
+      if (a.hosts.size < 25) a.hosts.add(host);
+      if (ts < a.first) a.first = ts;
+      if (ts > a.last) a.last = ts;
+      if (blocked) a.blocked++;
+    }
+  }
+}
+
+function pruneAttackers() {
+  const top = [...A.attacker.entries()].sort((a, b) => b[1].n - a[1].n).slice(0, 8000);
+  A.attacker = new Map(top);
+}
+
+/* Canonical spelling matters: the match is case-insensitive, so returning the
+   text as it appeared split Amazonbot across two rows ("amazonbot" 1,097 and
+   "Amazonbot" 468) and understated it by a third. */
+const AI_AGENTS = ["GPTBot","OAI-SearchBot","ChatGPT-User","ClaudeBot","Claude-Web",
+  "Claude-SearchBot","Claude-User","anthropic-ai","PerplexityBot","Perplexity-User",
+  "CCBot","Google-Extended","Bytespider","meta-externalagent","Amazonbot",
+  "Applebot-Extended","cohere-ai","Diffbot","ImagesiftBot","Timpibot","YouBot","Omgili"];
+const AI_RE = new RegExp("(" + AI_AGENTS.join("|") + ")", "i");
+const AI_CANON = new Map(AI_AGENTS.map(a => [a.toLowerCase(), a]));
+function shortAgent(ua) {
+  const m = AI_RE.exec(ua || "");
+  return m ? AI_CANON.get(m[1].toLowerCase()) : (ua || "(unknown)").slice(0, 40);
+}
+
+/* ------------------------------------------------------------ filter engine
+   A filter is a plain object. Every key is optional and all present keys are
+   ANDed. String fields resolve to dictionary ids once, up front, so the scan
+   over all rows compares integers only.
+
+     host, client, edge, method, uaClass, owasp, signal, level, source  exact
+     status            exact numeric        statusClass  1..5 (leading digit)
+     pathEq            exact path           path         substring, case-insens.
+     ua                substring            referer      substring
+     query             substring            errmsg       substring
+     day               YYYY-MM-DD           from / to    epoch ms range
+     bytesEq           exact byte count     emptyBody    200 with 0 bytes
+     attack            any OWASP signal     soft/real    catch-all split          */
+function idOf(dict, v) { const i = dict.m.get(v); return i === undefined ? -1 : i; }
+
+function runFilter(f) {
+  const out = [];
+  if (!S.n) return out;
+  const has = k => f[k] !== undefined && f[k] !== null && f[k] !== "";
+
+  // Any exact-match term whose value never appears means an empty result, bail
+  // before scanning a million rows to prove it.
+  const eq = {};
+  for (const [key, col, dict] of [["host","host","dHost"],["client","client","dClient"],
+       ["edge","edge","dEdge"],["method","method","dMethod"],["uaClass","uaClass","dUAClass"],
+       ["owasp","owasp","dOwasp"],["signal","signal","dSignal"],["level","level","dLevel"],
+       ["pathEq","path","dPath"],["file","file","dFile"]]) {
+    if (!has(key)) continue;
+    const id = idOf(S[dict], f[key]);
+    if (id < 0) return out;
+    eq[col] = id;
+  }
+
+  const sub = {};
+  for (const [key, col, dict] of [["path","path","dPath"],["ua","ua","dUA"],
+       ["referer","referer","dRef"],["query","query","dQuery"],["errmsg","errmsg","dErr"]]) {
+    if (!has(key)) continue;
+    const needle = String(f[key]).toLowerCase();
+    sub[col] = S[dict].mask(v => v.toLowerCase().includes(needle));
+  }
+
+  const srcId = has("source") ? SRC_ID[f.source] : undefined;
+  const dayFrom = has("day") ? Date.parse(f.day + "T00:00:00Z") : null;
+  const dayTo = dayFrom == null ? null : dayFrom + 86400000;
+  const from = has("from") ? f.from : null, to = has("to") ? f.to : null;
+  const softSet = (f.soft || f.real) ? softKeys() : null;
+  // "-" is a classified-benign row; "" is a row the parser could not decode at
+  // all. Neither is an attack. Missing the second let all 90 undecodable lines
+  // count as attacks.
+  const noOw = S.dOwasp.m.get("-"), blankOw = S.dOwasp.m.get("");
+  const getId = S.dMethod.m.get("GET");
+
+  const A_ = S.ts.a, ST = S.status.a, BY = S.bytes.a;
+  for (let i = 0; i < S.n; i++) {
+    if (eq.host !== undefined && S.host.a[i] !== eq.host) continue;
+    if (eq.client !== undefined && S.client.a[i] !== eq.client) continue;
+    if (eq.edge !== undefined && S.edge.a[i] !== eq.edge) continue;
+    if (eq.method !== undefined && S.method.a[i] !== eq.method) continue;
+    if (eq.uaClass !== undefined && S.uaClass.a[i] !== eq.uaClass) continue;
+    if (eq.owasp !== undefined && S.owasp.a[i] !== eq.owasp) continue;
+    if (eq.signal !== undefined && S.signal.a[i] !== eq.signal) continue;
+    if (eq.level !== undefined && S.level.a[i] !== eq.level) continue;
+    if (eq.path !== undefined && S.path.a[i] !== eq.path) continue;
+    if (eq.file !== undefined && S.file.a[i] !== eq.file) continue;
+    if (srcId !== undefined && S.src.a[i] !== srcId) continue;
+    if (has("status") && ST[i] !== +f.status) continue;
+    if (has("statusClass") && Math.floor(ST[i] / 100) !== +f.statusClass) continue;
+    if (has("bytesEq") && BY[i] !== +f.bytesEq) continue;
+    // GET only. A HEAD is *supposed* to return 200 with no body, and counting
+    // those as broken responses inflated the figure from 361 to 813.
+    if (f.emptyBody && !(ST[i] === 200 && BY[i] === 0 && S.method.a[i] === getId)) continue;
+    if (f.attack && (S.owasp.a[i] === noOw || S.owasp.a[i] === blankOw)) continue;
+    if (dayFrom != null && (A_[i] < dayFrom || A_[i] >= dayTo)) continue;
+    if (from != null && A_[i] < from) continue;
+    if (to != null && A_[i] > to) continue;
+    if (sub.path && !sub.path[S.path.a[i]]) continue;
+    if (sub.ua && !sub.ua[S.ua.a[i]]) continue;
+    if (sub.referer && !sub.referer[S.referer.a[i]]) continue;
+    if (sub.query && !sub.query[S.query.a[i]]) continue;
+    if (sub.errmsg && !sub.errmsg[S.errmsg.a[i]]) continue;
+    if (softSet) {
+      const is2 = ST[i] >= 200 && ST[i] < 300;
+      const isSoft = is2 && softSet.has(S.dHost.str(S.host.a[i]) + "|" + BY[i]);
+      if (f.soft && !isSoft) continue;
+      if (f.real && (!is2 || isSoft)) continue;
+    }
+    out.push(i);
+  }
+  return out;
+}
+
+function rowAt(i) {
+  return {
+    ts:new Date(S.ts.a[i]).toISOString().replace("T", " ").replace(".000Z", ""),
+    source:SRC_NAME[S.src.a[i]], level:S.dLevel.str(S.level.a[i]),
+    host:S.dHost.str(S.host.a[i]), client:S.dClient.str(S.client.a[i]),
+    edge:S.dEdge.str(S.edge.a[i]), method:S.dMethod.str(S.method.a[i]),
+    path:S.dPath.str(S.path.a[i]), query:S.dQuery.str(S.query.a[i]),
+    status:S.status.a[i] || "", bytes:S.bytes.a[i],
+    referer:S.dRef.str(S.referer.a[i]), ua:S.dUA.str(S.ua.a[i]),
+    uaClass:S.dUAClass.str(S.uaClass.a[i]), owasp:S.dOwasp.str(S.owasp.a[i]),
+    signal:S.dSignal.str(S.signal.a[i]), errmsg:S.dErr.str(S.errmsg.a[i]),
+    file:S.dFile.str(S.file.a[i]),
+  };
+}
+
+/* ------------------------------------------------------------------- charts */
+function line(cv, series, opts = {}) {
+  const dpr = devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
+  cv.width = W * dpr; cv.height = H * dpr;
+  const g = cv.getContext("2d"); g.scale(dpr, dpr); g.clearRect(0, 0, W, H);
+  const pad = { l:46, r:10, t:12, b:22 };
+  const w = W - pad.l - pad.r, h = H - pad.t - pad.b;
+  const n = Math.max(...series.map(s => s.data.length), 1);
+  const max = opts.max || Math.max(1, ...series.flatMap(s => s.data));
+
+  g.strokeStyle = "#2a3240"; g.fillStyle = "#5e6b7d"; g.font = "10px ui-monospace,monospace"; g.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = pad.t + h - (h * i / 4);
+    g.beginPath(); g.moveTo(pad.l, y); g.lineTo(W - pad.r, y); g.stroke();
+    g.fillText(short(max * i / 4), 4, y + 3);
+  }
+  series.forEach(s => {
+    g.strokeStyle = s.color; g.lineWidth = 1.8; g.beginPath();
+    s.data.forEach((v, i) => {
+      const x = pad.l + (n === 1 ? w / 2 : w * i / (n - 1)), y = pad.t + h - h * v / max;
+      i ? g.lineTo(x, y) : g.moveTo(x, y);
+    });
+    g.stroke();
+    if (s.fill) {
+      g.lineTo(pad.l + w, pad.t + h); g.lineTo(pad.l, pad.t + h); g.closePath();
+      g.fillStyle = s.color + "22"; g.fill();
+    }
+  });
+  if (opts.labels && opts.labels.length) {
+    g.fillStyle = "#5e6b7d";
+    const step = Math.max(1, Math.ceil(opts.labels.length / 7));
+    opts.labels.forEach((L, i) => {
+      if (i % step) return;
+      g.fillText(L, pad.l + (n === 1 ? w / 2 : w * i / (n - 1)) - 16, H - 6);
+    });
+  }
+  if (opts.legend !== false && series.length > 1) {
+    let x = pad.l + 4;
+    series.forEach(s => {
+      g.fillStyle = s.color; g.fillRect(x, 4, 8, 3);
+      g.fillStyle = "#8b98a8"; g.fillText(s.name, x + 12, 8);
+      x += 20 + g.measureText(s.name).width;
+    });
+  }
+}
+
+function bars(cv, data, color = "#4c9aff") {
+  const dpr = devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
+  cv.width = W * dpr; cv.height = H * dpr;
+  const g = cv.getContext("2d"); g.scale(dpr, dpr); g.clearRect(0, 0, W, H);
+  const pad = { l:46, r:10, t:12, b:22 }, w = W - pad.l - pad.r, h = H - pad.t - pad.b;
+  const max = Math.max(1, ...data.map(d => d[1]));
+  g.font = "10px ui-monospace,monospace";
+  g.strokeStyle = "#2a3240"; g.fillStyle = "#5e6b7d";
+  for (let i = 0; i <= 4; i++) {
+    const y = pad.t + h - h * i / 4;
+    g.beginPath(); g.moveTo(pad.l, y); g.lineTo(W - pad.r, y); g.stroke();
+    g.fillText(short(max * i / 4), 4, y + 3);
+  }
+  const bw = w / data.length;
+  data.forEach((d, i) => {
+    const bh = h * d[1] / max;
+    g.fillStyle = color;
+    g.fillRect(pad.l + i * bw + bw * .15, pad.t + h - bh, bw * .7, bh);
+    if (data.length <= 26 || i % Math.ceil(data.length / 12) === 0) {
+      g.fillStyle = "#5e6b7d";
+      g.fillText(String(d[0]).slice(-6), pad.l + i * bw, H - 6);
+    }
+  });
+}
+
+const short = v => v >= 1e6 ? (v/1e6).toFixed(1)+"M" : v >= 1e3 ? (v/1e3).toFixed(0)+"k" : Math.round(v);
+
+/* ------------------------------------------------------------ drill-down UI */
+const D = { filter:null, idx:[], page:0, per:100, label:"", cols:{}, sortDesc:true };
+
+const COLUMN_FILTERS = [
+  { k:"host",    label:"Host",       ph:"exact host" },
+  { k:"client",  label:"Client IP",  ph:"exact IP" },
+  { k:"path",    label:"Path",       ph:"contains…" },
+  { k:"query",   label:"Query",      ph:"contains…" },
+  { k:"status",  label:"Status",     ph:"e.g. 404" },
+  { k:"method",  label:"Method",     ph:"GET" },
+  { k:"uaClass", label:"Client type",ph:"browser…" },
+  { k:"ua",      label:"User agent",  ph:"contains…" },
+  { k:"owasp",   label:"OWASP",      ph:"A01" },
+  { k:"signal",  label:"Signal",     ph:"sqli" },
+  { k:"source",  label:"Log",        ph:"access" },
+  { k:"file",    label:"Source file",ph:"nginx-access.log" },
+  { k:"day",     label:"Day",        ph:"YYYY-MM-DD" },
+];
+
+function drill(filter, label) {
+  D.filter = filter || {}; D.cols = {}; D.label = label || "Selected rows"; D.page = 0;
+  recompute();
+  $("#drawer").classList.add("open");
+}
+
+function recompute() {
+  const f = Object.assign({}, D.filter);
+  // Column filters refine the selection you clicked rather than replacing it,
+  // so "404s" plus host=x plus path=/t/ narrows instead of starting over.
+  for (const [k, v] of Object.entries(D.cols)) if (v !== "") f[k] = v;
+  const t0 = performance.now();
+  D.idx = runFilter(f);
+  D.ms = performance.now() - t0;
+  D.page = 0;
+  D.sorted = false;
+  paintDrawer();
+}
+
+function paintDrawer() {
+  const total = D.idx.length, pages = Math.max(1, Math.ceil(total / D.per));
+  if (D.page >= pages) D.page = pages - 1;
+  const start = D.page * D.per;
+  // Sort by timestamp, not by reversing insertion order. With several files
+  // loaded the rows arrive file-by-file, so "newest first" meant "last file
+  // first" and the ordering was silently wrong.
+  if (!D.sorted) {
+    D.idx.sort((a, b) => S.ts.a[a] - S.ts.a[b] || a - b);
+    D.sorted = true;
+  }
+const end = start + D.per;
+const view = D.sortDesc
+  ? D.idx.slice(Math.max(0, total - end), Math.max(0, total - start)).reverse()
+  : D.idx.slice(start, end);
+
+  const active = Object.entries(Object.assign({}, D.filter, D.cols))
+    .filter(([, v]) => v !== "" && v !== undefined && v !== null && v !== false)
+    .map(([k, v]) => `<span class="pill">${esc(k)}=${esc(String(v))}</span>`).join(" ");
+
+  $("#dTitle").innerHTML = esc(D.label);
+  $("#dMeta").innerHTML =
+    `<b>${fmt(total)}</b> matching ${total === 1 ? "row" : "rows"} of ${fmt(S.n)} ` +
+    `· scanned in ${D.ms < 1 ? "<1" : Math.round(D.ms)} ms ${active ? "· " + active : ""}` +
+    (S.overflow ? ` · <span class="pill warn">row store truncated</span>` : "");
+
+  const head = ["Time","Log","Host","Client IP","Method","Path","Status","Bytes","Client type","OWASP / signal","User agent"];
+  let h = "<table><thead><tr>" + head.map((x, i) =>
+    `<th class="${i===6||i===7?"n":""}">${x}</th>`).join("") + "</tr></thead><tbody>";
+  for (const i of view) {
+    const r = rowAt(i);
+    const st = r.status ? String(r.status) : "";
+    const cls = st ? (st[0]==="2"?"ok":st[0]==="5"?"bad":st[0]==="4"?"warn":"") : "";
+    h += `<tr>
+      <td class="mono nowrap">${esc(r.ts)}</td>
+      <td><span class="pill" title="${esc(r.file)}">${esc(r.source)}${r.level ? " " + esc(r.level) : ""}</span></td>
+      <td class="mono">${esc(r.host) || "<span style='color:var(--dimmer)'>—</span>"}</td>
+      <td class="mono nowrap">${esc(r.client)}</td>
+      <td class="mono">${esc(r.method)}</td>
+      <td class="mono trunc">${esc(r.path + (r.query ? "?" + r.query : "")) || (r.errmsg ? "<i style='color:var(--dim)'>" + esc(r.errmsg.slice(0,120)) + "</i>" : "")}</td>
+      <td class="n">${st ? `<span class="pill ${cls}">${st}</span>` : "—"}</td>
+      <td class="n mono">${r.bytes < 0 ? "—" : fmt(r.bytes)}</td>
+      <td>${esc(r.uaClass)}</td>
+      <td class="mono">${r.owasp && r.owasp !== "-" ? `<span class="pill bad">${esc(r.owasp)}</span> ${esc(r.signal)}` : "—"}</td>
+      <td class="trunc" title="${esc(r.ua)}">${esc(r.ua.slice(0, 60))}</td>
+    </tr>`;
+  }
+  h += "</tbody></table>";
+  if (!total) h = `<p style="color:var(--dim);padding:18px">No rows match. Clear a column filter and try again.</p>`;
+  $("#dRows").innerHTML = h;
+
+  $("#dPager").innerHTML = total
+    ? `page <b>${fmt(D.page+1)}</b> of ${fmt(pages)} · showing ${fmt(start+1)}–${fmt(Math.min(start+D.per, total))}`
+    : "";
+  $("#dFirst").disabled = $("#dPrev").disabled = D.page === 0;
+  $("#dNext").disabled = $("#dLast").disabled = D.page >= pages - 1;
+}
+
+function drawerInit() {
+  const bar = $("#dCols");
+  COLUMN_FILTERS.forEach(c => {
+    const w = el("label", "colf", `<span>${c.label}</span>`);
+    const inp = el("input");
+    inp.placeholder = c.ph; inp.dataset.k = c.k;
+    let t;
+    inp.oninput = () => { clearTimeout(t); t = setTimeout(() => {
+      D.cols[c.k] = inp.value.trim(); recompute();
+    }, 220); };
+    w.appendChild(inp); bar.appendChild(w);
+  });
+  $("#dClose").onclick = () => $("#drawer").classList.remove("open");
+  $("#dClear").onclick = () => {
+    D.cols = {}; [...$("#dCols").querySelectorAll("input")].forEach(i => i.value = "");
+    recompute();
+  };
+  $("#dFirst").onclick = () => { D.page = 0; paintDrawer(); };
+  $("#dPrev").onclick  = () => { D.page--; paintDrawer(); };
+  $("#dNext").onclick  = () => { D.page++; paintDrawer(); };
+  $("#dLast").onclick  = () => { D.page = Math.ceil(D.idx.length / D.per) - 1; paintDrawer(); };
+  $("#dSort").onclick  = () => { D.sortDesc = !D.sortDesc;
+    $("#dSort").textContent = D.sortDesc ? "Newest first" : "Oldest first"; paintDrawer(); };
+  // Guarded: a page size of 0 makes the page count Infinity and the table render
+  // nothing, with no error to explain why.
+  $("#dPer").onchange  = () => { D.per = +$("#dPer").value || 100; D.page = 0; paintDrawer(); };
+  $("#dCsv").onclick   = () => {
+    // Exports the whole selection, not just the visible page.
+    const head = ["ts","source","level","host","client_ip","edge_ip","method","path","query",
+                  "status","bytes","referer","user_agent","ua_class","owasp","signal","error_msg","file"];
+    const q = v => { v = String(v == null ? "" : v);
+      return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; };
+    const lines = [head.join(",")];
+    for (const i of D.idx) { const r = rowAt(i);
+      lines.push([r.ts,r.source,r.level,r.host,r.client,r.edge,r.method,r.path,r.query,
+                  r.status,r.bytes < 0 ? "" : r.bytes,r.referer,r.ua,r.uaClass,r.owasp,
+                  r.signal,r.errmsg,r.file].map(q).join(",")); }
+    download("filtered-logs.csv", lines.join("\n") + "\n");
+  };
+  document.addEventListener("keydown", e => {
+    if (e.key === "Escape") $("#drawer").classList.remove("open");
+    if (!$("#drawer").classList.contains("open")) return;
+    if (e.key === "ArrowRight" && !$("#dNext").disabled) $("#dNext").click();
+    if (e.key === "ArrowLeft" && !$("#dPrev").disabled) $("#dPrev").click();
+  });
+}
+
+/* Any element carrying data-f (a JSON filter) becomes a drill-down trigger. */
+document.addEventListener("click", e => {
+  const t = e.target.closest("[data-f]");
+  if (!t) return;
+  try { drill(JSON.parse(t.dataset.f), t.dataset.l || "Selected rows"); }
+  catch (err) { console.error("bad filter", t.dataset.f, err); }
+});
+
+document.addEventListener("keydown", e => {
+  if ((e.key !== "Enter" && e.key !== " ") || !document.activeElement) return;
+  const t = document.activeElement.closest?.("[data-f]");
+  if (!t) return;
+  e.preventDefault();
+  t.click();
+});
+
+const F = (filter, label) =>
+  ` data-f='${esc(JSON.stringify(filter)).replace(/'/g, "&#39;")}' data-l="${esc(label)}" role="button" tabindex="0" aria-label="${esc(label)}"`;
+
+/* --------------------------------------------------------------- rendering */
+/* `opts.filters` is an array parallel to `rows`: filters[i] is {f, l} and makes
+   row i clickable, opening the drill-down on exactly the rows behind it. */
+function table(cols, rows, opts = {}) {
+  const t = el("table");
+  t.appendChild(el("thead", "", "<tr>" + cols.map(c =>
+    `<th class="${c.n ? "n" : ""}">${c.h}</th>`).join("") + "</tr>"));
+  const tb = el("tbody");
+  rows.forEach((r, ri) => {
+    const tr = el("tr");
+    const fl = opts.filters && opts.filters[ri];
+    if (fl) {
+      tr.dataset.f = JSON.stringify(fl.f);
+      tr.dataset.l = fl.l;
+      tr.title = "Click to see the matching log rows";
+    }
+    r.forEach((v, i) => {
+      const td = el("td", (cols[i].n ? "n " : "") + (cols[i].trunc ? "trunc " : "") + (cols[i].cls || ""));
+      td.innerHTML = v;
+      if (cols[i].trunc) td.title = String(v).replace(/<[^>]+>/g, "");
+      tr.appendChild(td);
+    });
+    tb.appendChild(tr);
+  });
+  t.appendChild(tb);
+  const wrap = el("div", opts.scroll === false ? "" : "scroll");
+  wrap.appendChild(t);
+  return wrap;
+}
+
+/* `filter` makes the whole card a drill-down trigger. */
+function kpi(lab, val, cap, cls = "", filter = null) {
+  const attr = filter ? F(filter, lab) : "";
+  return `<div class="kpi ${cls}"${attr}><div class="lab">${lab}</div>
+          <div class="val">${val}</div><div class="cap">${cap || ""}</div></div>`;
+}
+
+function card(title, body) {
+  const c = el("div", "card");
+  c.innerHTML = `<h4>${title}</h4>`;
+  if (typeof body === "string") c.insertAdjacentHTML("beforeend", body);
+  else c.appendChild(body);
+  return c;
+}
+
+/* ------------------------------------------------------------------ report */
+const SECTIONS = [];
+function section(id, label, build) { SECTIONS.push({ id, label, build }); }
+
+function days() { return [...A.statusByDay.keys()].sort(); }
+
+/* scanners.log is `combined` format, which carries no $host, so a blank host is
+   "the deny-default vhost refused this", not missing data. Saying "(none)" and
+   leaving it at that invited exactly the wrong reading. */
+function hostLabel(h) {
+  return h === "(none)"
+    ? `<code>(no host)</code> <span class="pill">scanners.log</span>`
+    : `<code>${esc(h)}</code>`;
+}
+
+/* ---- soft-404 catch-all detection ---------------------------------------
+   A vhost that answers 200 with the same body for every unknown URL makes every
+   scanner probe look like a successful breach. On this estate one WordPress host
+   returns an identical 60,056-byte page for thousands of distinct paths, so
+   /.env, /.git/config and a plugin readme all "succeed" while nothing whatsoever
+   is exposed.
+
+   A (host, body-size) pair is treated as a catch-all when that exact size is
+   returned for many distinct paths on that host. Real files do not share a byte
+   count across hundreds of URLs; a template does. Attack hits landing on a
+   catch-all are reported as neutralised, not as exposure, and the catch-all
+   itself is raised separately, because it is its own bug. */
+let _soft = null;
+function softKeys() {
+  if (_soft) return _soft;
+  _soft = new Map();                       // "host|bytes" -> distinct path count
+  for (const [key, paths] of A.hostPathsAtSize) {
+    // Size 0 excluded: an empty body is a broken response, not a catch-all page,
+    // and folding the two together would hide a real bug behind a benign label.
+    if (paths.size >= 25 && !key.endsWith("|0")) _soft.set(key, paths.size);
+  }
+  return _soft;
+}
+/* Splits a signal's 2xx hits into genuinely served and swallowed-by-a-catch-all. */
+function softSplit(d) {
+  const soft = softKeys();
+  let s = 0;
+  for (const [key, n] of d.sizes.m) if (soft.has(key)) s += n;
+  return { soft:s, real:Math.max(0, d.served - s) };
+}
+function realServedTotal() {
+  let t = 0;
+  for (const [, d] of A.sigDetail) t += softSplit(d).real;
+  return t;
+}
+function softServedTotal() {
+  let t = 0;
+  for (const [, d] of A.sigDetail) t += softSplit(d).soft;
+  return t;
+}
+/* The catch-all hosts themselves, worst first. */
+function catchAllHosts() {
+  const by = new Map();
+  for (const [key, n] of softKeys()) {
+    const host = key.slice(0, key.lastIndexOf("|"));
+    const size = key.slice(key.lastIndexOf("|") + 1);
+    const cur = by.get(host);
+    if (!cur || n > cur.paths) by.set(host, { paths:n, size, hits:A.hostSize.get(key) });
+  }
+  return [...by.entries()].sort((a, b) => b[1].paths - a[1].paths);
+}
+
+/* --- A. Executive ------------------------------------------------------- */
+section("exec", "Executive summary", s => {
+  const req = A.requests;
+  const e5 = A.klass[5], e4 = A.klass[4];
+  const avail = req ? (100 * (1 - e5 / req)) : 100;
+  const atk = [...A.owasp.m.values()].reduce((a, b) => a + b, 0);
+  const served = realServedTotal(), soft = softServedTotal();
+  const dayCount = A.statusByDay.size || 1;
+  const human = [...A.dayHuman.m.values()].reduce((a, b) => a + b, 0);
+  const ai = A.uaClass.get("ai-crawler");
+
+  s.appendChild(el("h2", "", "Executive summary"));
+  s.appendChild(el("p", "lede",
+    `Every request nginx handled for <b>${fmt(A.host.size)}</b> hostnames between
+     <b>${A.tsMin.slice(0,10)}</b> and <b>${A.tsMax.slice(0,10)}</b>, ${fmt(dayCount)} days.
+     This covers the whole estate, not just Log explorer: the news site, its API and asset
+     hosts, the corporate sites, the mail and webmail stack, and the LDAP/admin panels.`));
+
+  s.insertAdjacentHTML("beforeend", `<div class="kpis">
+    ${kpi("Requests served", fmt(req), fmt(Math.round(req / dayCount)) + " / day", "", {})}
+    ${kpi("Unique visitors", fmt(A.uniqueClients.size), "distinct client IPs, X-Forwarded-For", "", { uaClass:"browser" })}
+    ${kpi("Bandwidth", bytes(A.bytes), bytes(A.bytes / dayCount) + " / day", "", {})}
+    ${kpi("Availability", avail.toFixed(3) + "%", fmt(e5) + " server errors", avail >= 99.9 ? "ok" : avail >= 99 ? "warn" : "bad", { statusClass:5 })}
+    ${kpi("Attack attempts", fmt(atk), pct(atk, req) + " of all traffic", atk ? "warn" : "ok", { attack:true })}
+    ${kpi("Attacks NOT blocked", fmt(served), served ? "returned real content, review" : "none reached real content", served ? "bad" : "ok", { attack:true, real:true })}
+    ${kpi("Absorbed by soft-404", fmt(soft), "2xx, but a catch-all page", "warn", { attack:true, soft:true })}
+    ${kpi("Human traffic", pct(human, req), fmt(human) + " browser requests", "", { uaClass:"browser" })}
+    ${kpi("AI crawler hits", fmt(ai), "GPTBot, ClaudeBot, PerplexityBot &amp;c.", "ai", { uaClass:"ai-crawler" })}
+    ${kpi("Client errors", fmt(e4), pct(e4, req) + ", 404/403 mix", "", { statusClass:4 })}
+    ${kpi("Log lines analysed", fmt(A.rows), `${fmt(A.access)} access · ${fmt(A.error)} error · ${fmt(A.scanners)} scanner`, "", {})}
+  </div>`);
+  s.insertAdjacentHTML("beforeend", `<p class="note" style="margin-top:10px">
+    <b>Every figure on this page is clickable.</b> Cards, table rows and OWASP signals all open
+    the underlying log lines, paginated, filterable by column, and exportable as CSV.</p>`);
+
+  const g = el("div", "grid g2"); g.style.marginTop = "16px";
+  const dd = days();
+
+  const c1 = card("Daily traffic and errors", "<canvas></canvas>");
+  g.appendChild(c1);
+  const c2 = card("Requests by hour of day (UTC)", "<canvas></canvas>");
+  g.appendChild(c2);
+  s.appendChild(g);
+
+  requestAnimationFrame(() => {
+    line(c1.querySelector("canvas"), [
+      { name:"requests", color:"#4c9aff", data: dd.map(d => A.statusByDay.get(d).t), fill:true },
+      { name:"4xx", color:"#d29922", data: dd.map(d => A.statusByDay.get(d).e4) },
+      { name:"5xx", color:"#f85149", data: dd.map(d => A.statusByDay.get(d).e5) },
+    ], { labels: dd.map(d => d.slice(5)) });
+    bars(c2.querySelector("canvas"), A.hourOfDay.map((v, i) => [String(i).padStart(2,"0"), v]));
+  });
+
+  s.appendChild(el("h3", "", "What this says"));
+  const verdict = el("div");
+  const notes = [];
+  notes.push(`<b>${pct(atk, req)}</b> of all traffic is hostile probing, ${fmt(atk)} requests
+    matched an OWASP signature. ${served ? `<b class="pill bad">${fmt(served)} reached real content</b>
+    and need an eyeball.` : `None reached real content.`}
+    A further ${fmt(soft)} returned 2xx only because a vhost answers every unknown URL with the
+    same catch-all page, those are noise, not exposure, and the report separates them rather
+    than reporting a breach that did not happen.`);
+  notes.push(`Availability was <b>${avail.toFixed(3)}%</b>, with ${fmt(e5)} 5xx responses.
+    ${e5 > 1000 ? "That is concentrated in bursts rather than spread evenly, see Availability." : ""}`);
+  notes.push(`Only <b>${pct(human, req)}</b> of requests came from a real browser. The rest is
+    crawlers, tools and scanners, normal for a news site, but it means raw request counts
+    overstate the audience by roughly ${(req / Math.max(human,1)).toFixed(1)}×.`);
+  notes.push(`AI assistants fetched <b>${fmt(ai)}</b> pages. That is the traffic the robots.txt
+    work was aimed at, and it is now measurable.`);
+  verdict.innerHTML = "<ul style='color:var(--dim);max-width:90ch'>" +
+    notes.map(n => `<li style="margin-bottom:7px">${n}</li>`).join("") + "</ul>";
+  s.appendChild(verdict);
+});
+
+/* --- B. Availability ---------------------------------------------------- */
+section("avail", "Availability", s => {
+  const dd = days();
+  const req = A.requests;
+  s.appendChild(el("h2", "", "Availability &amp; reliability"));
+  s.appendChild(el("p", "lede",
+    `Server-side failures only. ${fmt(A.klass[5])} responses in the 5xx range across
+     ${fmt(dd.length)} days. Spikes matter more than the total: a flat error rate is a bug,
+     a spike is an incident.`));
+
+  const wd = worstDayKey();
+  s.insertAdjacentHTML("beforeend", `<div class="kpis">
+    ${kpi("5xx total", fmt(A.klass[5]), pct(A.klass[5], req) + " of requests", A.klass[5] ? "bad" : "ok", { statusClass:5 })}
+    ${kpi("502 Bad Gateway", fmt(A.status.get("502")), "upstream unreachable", "bad", { status:502 })}
+    ${kpi("504 Gateway Timeout", fmt(A.status.get("504")), "upstream too slow", A.status.get("504") ? "warn" : "ok", { status:504 })}
+    ${kpi("499 client aborted", fmt(A.status.get("499")), "reader left before we answered", "warn", { status:499 })}
+    ${kpi("Worst day", worstDay(), "highest 5xx count", "warn", wd ? { statusClass:5, day:wd } : null)}
+    ${kpi("nginx error lines", fmt(A.error), fmt(A.errLevel.get("emerg")) + " at [emerg]", A.errLevel.get("emerg") ? "bad" : "ok", { source:"error" })}
+  </div>`);
+
+  const g = el("div", "grid g2"); g.style.marginTop = "16px";
+  const c1 = card("5xx per day", "<canvas></canvas>"); g.appendChild(c1);
+  const c2 = card("nginx error-log lines per day", "<canvas></canvas>"); g.appendChild(c2);
+  s.appendChild(g);
+  requestAnimationFrame(() => {
+    line(c1.querySelector("canvas"), [{ name:"5xx", color:"#f85149",
+      data: dd.map(d => A.statusByDay.get(d).e5), fill:true }],
+      { labels: dd.map(d => d.slice(5)), legend:false });
+    line(c2.querySelector("canvas"), [{ name:"errors", color:"#d29922",
+      data: dd.map(d => A.dayErr.get(d)), fill:true }],
+      { labels: dd.map(d => d.slice(5)), legend:false });
+  });
+
+  s.appendChild(el("h3", "", "5xx by host and code"));
+  const h5 = A.p502host.top(25);
+  s.appendChild(table(
+    [{h:"Host and status"},{h:"Count",n:true}],
+    h5.map(([k, v]) => {
+      const i = k.lastIndexOf(" ");
+      return [`<code>${esc(k.slice(0, i))}</code> <span class="pill bad">${esc(k.slice(i+1))}</span>`, fmt(v)];
+    }),
+    { filters: h5.map(([k]) => { const i = k.lastIndexOf(" ");
+      return { f:{ host:k.slice(0, i), status:+k.slice(i+1) }, l:`${k.slice(i+1)} on ${k.slice(0, i)}` }; }) }));
+  s.insertAdjacentHTML("beforeend", `<p class="note">
+    <b>Known cause for the bulk of the 502s.</b> nginx resolves each proxied container name
+    <i>once, at startup</i>, and caches the address forever. Any <code>docker compose up -d</code>
+    that recreates a container gives it a new IP, and every proxied request 502s until
+    <code>docker exec nginx-certbot nginx -s reload</code> runs. The spikes in the chart above
+    should line up with deploys, not with traffic peaks, if one does not, it is a real outage
+    and worth chasing separately.</p>`);
+
+  if (A.emptyBodyN) {
+    s.appendChild(el("h3", "", `Successful responses with an empty body (${fmt(A.emptyBodyN)})`));
+    const eb = A.emptyBody.top(25);
+    s.appendChild(table([{h:"Host and path", trunc:true},{h:"Hits",n:true}],
+      eb.map(([k, v]) => [`<code>${esc(k)}</code>`, fmt(v)]),
+      { filters: eb.map(([k]) => { const i = k.indexOf(" ");
+        return { f:{ host:k.slice(0, i), pathEq:k.slice(i+1), emptyBody:true },
+                 l:"Empty 200 · " + k }; }) }));
+    s.insertAdjacentHTML("beforeend", `<p class="note">
+      A <code>GET</code> that returns <b>200 with zero bytes</b> is a blank page for the reader
+      and an empty document for the crawler, worse than an error, because nothing retries it
+      and Google may index the blank. On statically-served SSR pages the usual cause is a file
+      being read while it is still being written: unless the generator writes to a temporary
+      file and <code>rename()</code>s it into place, a request landing mid-write sees a
+      zero-length file. Worth checking against how the SSR pages are written.</p>`);
+  }
+
+  s.appendChild(el("h3", "", "Most frequent nginx errors"));
+  const em = A.errMsg.top(25);
+  s.appendChild(table([{h:"Error", trunc:true},{h:"Count",n:true}],
+    em.map(([k, v]) => [`<code>${esc(k)}</code>`, fmt(v)]),
+    { filters: em.map(([k]) => ({ f:{ source:"error", errmsg:k.slice(0, 60) },
+                                  l:"nginx error · " + k.slice(0, 60) })) }));
+
+  if (A.emerg.length) {
+    s.appendChild(el("h3", "", `[emerg] events, nginx could not start or bind (${fmt(A.errLevel.get("emerg"))})`));
+    s.appendChild(table([{h:"When"},{h:"Message", trunc:true}],
+      A.emerg.slice(0, 30).map(e => [e.ts.replace("T"," ").replace("Z",""), `<code>${esc(e.msg)}</code>`]),
+      { filters: A.emerg.slice(0, 30).map(() => ({ f:{ source:"error", level:"emerg" }, l:"[emerg] events" })) }));
+    s.insertAdjacentHTML("beforeend", `<p class="note">An <code>[emerg]</code> is the most severe
+      level nginx emits, the process could not do what it was told. Each one is a window where
+      configuration was broken or a port was unavailable.</p>`);
+  }
+});
+
+function worstDayEntry() {
+  let best = null;
+  for (const [d, v] of A.statusByDay) if (!best || v.e5 > best[1].e5) best = [d, v];
+  return best;
+}
+function worstDayKey() { const b = worstDayEntry(); return b ? b[0] : null; }
+function worstDay() {
+  const b = worstDayEntry();
+  return b ? `${fmt(b[1].e5)}<span style="font-size:13px;color:var(--dimmer)"> on ${b[0].slice(5)}</span>` : "—";
+}
+
+/* --- C. Traffic --------------------------------------------------------- */
+section("traffic", "Traffic &amp; audience", s => {
+  const req = A.requests;
+  s.appendChild(el("h2", "", "Traffic &amp; audience"));
+  s.appendChild(el("p", "lede",
+    `Which of the ${fmt(A.host.size)} hostnames on this box actually carries load, who is
+     asking, and what they ask for. Visitor counts key off X-Forwarded-For, behind Cloudflare
+     the connecting address is an edge PoP, so counting it would report a few hundred data
+     centres as the entire audience.`));
+
+  const hosts = A.host.top(22), mix = A.uaClass.top(12);
+  const g = el("div", "grid g2");
+  const hostCard = card("Requests by host", "");
+  hostCard.appendChild(table(
+    [{h:"Host"},{h:"Requests",n:true},{h:"Share",n:true},{h:"Bandwidth",n:true}],
+    hosts.map(([h, v]) => [hostLabel(h), fmt(v), pct(v, A.rows), bytes(A.hostBytes.get(h))]),
+    { filters: hosts.map(([h]) => ({ f:{ host:h === "(none)" ? "" : h }, l:"Host · " + h })) }));
+  g.appendChild(hostCard);
+  const mixCard = card("Client mix", "");
+  mixCard.appendChild(table(
+    [{h:"Class"},{h:"Requests",n:true},{h:"Share",n:true}],
+    mix.map(([k, v]) => [
+      `<span class="pill ${k==="browser"?"ok":k==="scanner"?"bad":""}">${esc(k)}</span>`,
+      fmt(v), pct(v, req) + `<div class="bar"><i style="width:${(100*v/req).toFixed(1)}%"></i></div>`]),
+    { scroll:false, filters: mix.map(([k]) => ({ f:{ uaClass:k }, l:"Client type · " + k })) }));
+  g.appendChild(mixCard);
+  s.appendChild(g);
+  s.insertAdjacentHTML("beforeend", `<p class="note">
+    <code>(none)</code> is not a missing value: those rows come from
+    <code>scanners.log</code>, which the deny-default vhost writes in <code>combined</code>
+    format, a format with no <code>$host</code> field. They are blocked scanner traffic that
+    was never associated with one of your sites.</p>`);
+
+  s.appendChild(el("h3", "", "Human vs machine, per day"));
+  const c = card("", "<canvas></canvas>"); s.appendChild(c);
+  const dd = days();
+  requestAnimationFrame(() => line(c.querySelector("canvas"), [
+    { name:"browser", color:"#3fb950", data: dd.map(d => A.dayHuman.get(d)), fill:true },
+    { name:"non-browser", color:"#8b98a8", data: dd.map(d => A.dayBot.get(d)) },
+  ], { labels: dd.map(d => d.slice(5)) }));
+
+  s.appendChild(el("h3", "", "Status codes"));
+  const sts = A.status.top(18);
+  s.appendChild(table([{h:"Status"},{h:"Responses",n:true},{h:"Share",n:true}],
+    sts.map(([k, v]) => [
+      `<span class="pill ${k[0]==="2"?"ok":k[0]==="5"?"bad":k[0]==="4"?"warn":""}">${esc(k)}</span>`,
+      fmt(v), pct(v, req)]),
+    { filters: sts.map(([k]) => ({ f:{ status:+k }, l:"Status " + k })) }));
+
+  s.appendChild(el("h3", "", "Most requested paths"));
+  const paths = A.path.top(30);
+  s.appendChild(table([{h:"Path", trunc:true},{h:"Requests",n:true}],
+    paths.map(([k, v]) => [`<code>${esc(k)}</code>`, fmt(v)]),
+    { filters: paths.map(([k]) => ({ f:{ pathEq:k }, l:"Path · " + k })) }));
+
+  s.appendChild(el("h3", "", "Top referrers"));
+  const refs = A.referer.top(25);
+  s.appendChild(table([{h:"Referrer", trunc:true},{h:"Requests",n:true}],
+    refs.map(([k, v]) => [`<code>${esc(k)}</code>`, fmt(v)]),
+    { filters: refs.map(([k]) => ({ f:{ referer:k }, l:"Referrer · " + k })) }));
+
+  s.appendChild(el("h3", "", "Top client IPs (all traffic, not only attacks)"));
+  const ips = A.client.top(25);
+  s.appendChild(table([{h:"Client IP"},{h:"Requests",n:true},{h:"Note"}],
+    ips.map(([k, v]) => [`<code>${esc(k)}</code>`, fmt(v), ipNote(k)]),
+    { filters: ips.map(([k]) => ({ f:{ client:k }, l:"Client IP · " + k })) }));
+  s.insertAdjacentHTML("beforeend", `<p class="note">
+    <code>127.0.0.1</code> appearing here is not a visitor. It is what arrives when a request
+    reaches nginx with <code>X-Forwarded-For: 127.0.0.1</code>, container-to-container calls,
+    health checks, and anything that sets the header itself. Those rows are excluded from the
+    attacker ranking, since blocking loopback would take the platform down.</p>`);
+
+  s.appendChild(el("h3", "", "HTTP methods"));
+  const meth = A.method.top(15);
+  s.appendChild(table([{h:"Method"},{h:"Count",n:true}],
+    meth.map(([k, v]) => [`<code>${esc(k)}</code>`, fmt(v)]),
+    { filters: meth.map(([k]) => ({ f:{ method:k }, l:"Method · " + k })) }));
+});
+
+/* Addresses that are infrastructure rather than an audience or an adversary. */
+const INTERNAL_IPS = new Set(["127.0.0.1", "::1", "localhost", "0.0.0.0", "unix:"]);
+function isInternalIP(ip) {
+  if (INTERNAL_IPS.has(ip)) return true;
+  return /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|fc|fd)/i.test(ip);
+}
+function ipNote(ip) {
+  return isInternalIP(ip)
+    ? `<span class="pill warn">internal / loopback, not a visitor</span>` : "";
+}
+
+/* --- D. SEO ------------------------------------------------------------- */
+section("seo", "SEO &amp; crawl health", s => {
+  const cr = [...A.crawlerDay.m.values()].reduce((a, b) => a + b, 0);
+  const ai = A.uaClass.get("ai-crawler");
+  s.appendChild(el("h2", "", "SEO &amp; crawl health"));
+  s.appendChild(el("p", "lede",
+    `Search-engine crawl budget is finite. Every 404 a crawler hits is a page it did not spend
+     that budget indexing, and on an archive this size that is the difference between the long
+     tail being indexed and being invisible.`));
+
+  const c404 = A.crawler404.top(1).length
+    ? [...A.crawler404.m.values()].reduce((a, b) => a + b, 0) : 0;
+
+  s.insertAdjacentHTML("beforeend", `<div class="kpis">
+    ${kpi("Search-crawler requests", fmt(cr), "Googlebot, Bingbot &amp;c.", "", { uaClass:"search-crawler" })}
+    ${kpi("Crawler 404s", fmt(c404), pct(c404, cr) + " of crawl budget wasted", c404 / Math.max(cr,1) > .1 ? "bad" : c404 ? "warn" : "ok", { uaClass:"search-crawler", status:404 })}
+    ${kpi("AI-assistant requests", fmt(ai), "GPTBot, ClaudeBot, Perplexity &amp;c.", "ai", { uaClass:"ai-crawler" })}
+    ${kpi("301 redirects", fmt(A.status.get("301")), "mostly the asset-host redirect", "", { status:301 })}
+    ${kpi("Site 404s (all agents)", fmt(A.status.get("404")), pct(A.status.get("404"), A.requests), "", { status:404 })}
+  </div>`);
+
+  s.appendChild(el("h3", "", "Search-crawler activity per day"));
+  const c = card("", "<canvas></canvas>"); s.appendChild(c);
+  const dd = days();
+  requestAnimationFrame(() => line(c.querySelector("canvas"),
+    [{ name:"crawler hits", color:"#39c5cf", data: dd.map(d => A.crawlerDay.get(d)), fill:true }],
+    { labels: dd.map(d => d.slice(5)), legend:false }));
+
+  const cst = A.crawlerStatus.top(12), aia = A.aiAgent.top(15);
+  const g = el("div", "grid g2"); g.style.marginTop = "16px";
+  const gc1 = card("What crawlers get back", "");
+  gc1.appendChild(table([{h:"Status"},{h:"Count",n:true},{h:"Share",n:true}],
+    cst.map(([k, v]) => [
+      `<span class="pill ${k[0]==="2"?"ok":k[0]==="5"?"bad":k[0]==="4"?"warn":""}">${esc(k)}</span>`,
+      fmt(v), pct(v, cr)]),
+    { scroll:false, filters: cst.map(([k]) =>
+      ({ f:{ uaClass:"search-crawler", status:+k }, l:`Crawlers receiving ${k}` })) }));
+  g.appendChild(gc1);
+  const gc2 = card("AI assistants by agent", "");
+  gc2.appendChild(table([{h:"Agent"},{h:"Requests",n:true}],
+    aia.map(([k, v]) => [`<code>${esc(k)}</code>`, fmt(v)]),
+    { scroll:false, filters: aia.map(([k]) =>
+      ({ f:{ uaClass:"ai-crawler", ua:k }, l:"AI agent · " + k })) }));
+  g.appendChild(gc2);
+  s.appendChild(g);
+
+  s.appendChild(el("h3", "", "Top 404s hit by search crawlers, wasted crawl budget"));
+  const c4 = A.crawler404.top(40);
+  s.appendChild(table([{h:"Path", trunc:true},{h:"Hits",n:true}],
+    c4.map(([k, v]) => [`<code>${esc(k)}</code>`, fmt(v)]),
+    { filters: c4.map(([k]) => ({ f:{ pathEq:k, status:404, uaClass:"search-crawler" },
+                                  l:"Crawler 404 · " + k })) }));
+  s.insertAdjacentHTML("beforeend", `<p class="note">Each row is a URL Google still believes
+    exists. Either it should resolve, in which case this is a routing bug, or it should be
+    left to 404 so the index drops it, which is the intended behaviour for retired URLs.</p>`);
+
+  s.appendChild(el("h3", "", "Most-requested pages by AI assistants"));
+  const aip = A.aiPath.top(25);
+  s.appendChild(table([{h:"Path", trunc:true},{h:"Hits",n:true}],
+    aip.map(([k, v]) => [`<code>${esc(k)}</code>`, fmt(v)]),
+    { filters: aip.map(([k]) => ({ f:{ pathEq:k, uaClass:"ai-crawler" }, l:"AI fetched · " + k })) }));
+
+  const ca = catchAllHosts();
+  if (ca.length) {
+    s.appendChild(el("h3", "", "Soft-404 catch-alls, hosts that answer 200 for anything"));
+    s.appendChild(table(
+      [{h:"Host"},{h:"Identical body"},{h:"Distinct paths returning it",n:true},{h:"Requests",n:true}],
+      ca.slice(0, 15).map(([h, i]) => [`<code>${esc(h)}</code>`, bytes(+i.size),
+        fmt(i.paths) + (i.paths >= 5000 ? "+" : ""), fmt(i.hits)]),
+      { filters: ca.slice(0, 15).map(([h, i]) =>
+          ({ f:{ host:h, bytesEq:+i.size }, l:`Catch-all page · ${h} (${i.size} B)` })) }));
+    s.insertAdjacentHTML("beforeend", `<p class="note">
+      Each of these hosts returns one identical page, with status 200, for URLs that do not
+      exist. Search engines index every one of them as a separate duplicate page, which both
+      dilutes ranking and burns crawl budget, and security scanners read the 200 as "this file
+      is here", which is why the OWASP tab separates a genuine 2xx from one of these.
+      The <b>distinct paths</b> column is the count actually observed in this window; the real
+      figure is unbounded, since any URL at all produces the same page.</p>`);
+  }
+
+  s.appendChild(el("h3", "", "All 404s, site-wide"));
+  const p4 = A.p404.top(40);
+  s.appendChild(table([{h:"Host and path", trunc:true},{h:"Hits",n:true}],
+    p4.map(([k, v]) => [`<code>${esc(k)}</code>`, fmt(v)]),
+    { filters: p4.map(([k]) => { const i = k.indexOf(" ");
+      return { f:{ host:k.slice(0, i), pathEq:k.slice(i+1), status:404 }, l:"404 · " + k }; }) }));
+});
+
+/* --- E. OWASP ----------------------------------------------------------- */
+section("owasp", "OWASP Top 10", s => {
+  const total = [...A.owasp.m.values()].reduce((a, b) => a + b, 0);
+  s.appendChild(el("h2", "", "OWASP Top 10 (2021), observed attempts"));
+  s.appendChild(el("p", "lede",
+    `${fmt(total)} requests across every hosted service matched an attack signature. Each
+     category below drills to the exact rule that fired and the raw log lines behind it,
+     a count with no reproducible evidence line is a false positive, not a finding.
+     <b>Blocked</b> means the request was refused or 404'd; <b>served</b> means it returned
+     2xx and deserves a human look.`));
+
+  const tabs = el("div", "subtabs");
+  const body = el("div");
+  const cats = Object.keys(OWASP_NAMES);
+  cats.forEach(cat => {
+    const n = A.owasp.get(cat);
+    // A09 is a property of the platform, not something an attacker sends. A "0"
+    // beside it read as "no logging problems found", which is the opposite of
+    // what that tab reports.
+    const badge = cat === "A09" ? "audit" : fmt(n);
+    const b = el("button", "", `${cat} <span style="color:var(--dim)">${OWASP_NAMES[cat]}</span>
+                                <span class="c">${badge}</span>`);
+    b.onclick = () => {
+      [...tabs.children].forEach(x => x.classList.remove("on"));
+      b.classList.add("on"); body.innerHTML = ""; owaspCat(body, cat);
+    };
+    tabs.appendChild(b);
+  });
+  s.appendChild(tabs); s.appendChild(body);
+  tabs.children[0].click();
+});
+
+function owaspCat(root, cat) {
+  const n = A.owasp.get(cat), blk = A.owaspBlocked.get(cat);
+  let real = 0, soft = 0;
+  for (const [, d] of A.sigDetail) {
+    if (d.owasp !== cat) continue;
+    const s = softSplit(d); real += s.real; soft += s.soft;
+  }
+  root.insertAdjacentHTML("beforeend",
+    `<h3>${cat}, ${OWASP_NAMES[cat]}</h3>
+     <div class="kpis">
+       ${kpi("Attempts", fmt(n), "matched requests", n ? "warn" : "ok", { owasp:cat })}
+       ${kpi("Blocked / refused", fmt(blk), pct(blk, n), "ok", { owasp:cat })}
+       ${kpi("Reached real content", fmt(real), real ? "review these" : "none", real ? "bad" : "ok", { owasp:cat, real:true })}
+       ${kpi("Absorbed by soft-404", fmt(soft), "2xx from a catch-all page", soft ? "warn" : "ok", { owasp:cat, soft:true })}
+     </div>`);
+
+  if (!n) {
+    root.insertAdjacentHTML("beforeend",
+      `<p class="note">No requests matched a ${cat} signature in this window.
+       ${cat === "A09" ? "" : "That is a genuine zero, not a gap in coverage, the rules for this category are listed in <code>scripts/logs/logparse.go</code>."}</p>`);
+    if (cat === "A09") a09(root);
+    return;
+  }
+
+  const dd = days();
+  const c = card("Attempts per day", "<canvas></canvas>");
+  c.style.marginTop = "14px"; root.appendChild(c);
+  const cn = A.owaspDay[cat];
+  requestAnimationFrame(() => line(c.querySelector("canvas"),
+    [{ name:cat, color:"#f85149", data: dd.map(d => cn ? cn.get(d) : 0), fill:true }],
+    { labels: dd.map(d => d.slice(5)), legend:false }));
+
+  const sigs = [...A.sigDetail.entries()].filter(([, d]) => d.owasp === cat)
+                                         .sort((a, b) => b[1].count - a[1].count);
+
+  root.appendChild(el("h3", "", "Signals that fired"));
+  root.appendChild(table(
+    [{h:"Signal"},{h:"Attempts",n:true},{h:"Blocked",n:true},{h:"Reached content",n:true},
+     {h:"Soft-404",n:true},{h:"Source IPs",n:true},{h:"Targets hit", trunc:true}],
+    sigs.map(([k, d]) => {
+      const s = softSplit(d);
+      return [`<code>${esc(k)}</code>`, fmt(d.count), fmt(d.blocked),
+        s.real ? `<span class="pill bad">${fmt(s.real)}</span>` : "0",
+        s.soft ? `<span class="pill warn">${fmt(s.soft)}</span>` : "0",
+        fmt(d.ips.size), d.hosts.top(4).map(x => esc(x[0])).join(", ")];
+    }),
+    { filters: sigs.map(([k]) => ({ f:{ signal:k }, l:"Signal · " + k })) }));
+
+  // The verification queue. Everything the report is NOT willing to dismiss as a
+  // catch-all, with the evidence needed to judge it in one glance: if a body size
+  // is shared by several different filenames, it is one template being served,
+  // not several files being leaked. The threshold for automatic dismissal is 25
+  // distinct paths, deliberately conservative, so borderline cases surface here
+  // rather than being quietly written off.
+  const softSet = softKeys(), queue = [];
+  for (const [k, d] of sigs) {
+    for (const [key, n] of d.sizes.m) {
+      if (softSet.has(key)) continue;
+      const i = key.lastIndexOf("|");
+      const ps = A.hostPathsAtSize.get(key);
+      queue.push({ sig:k, host:key.slice(0, i), size:+key.slice(i+1),
+                   n, paths: ps ? ps.size : 1 });
+    }
+  }
+  queue.sort((a, b) => b.n - a.n);
+  if (queue.length) {
+    root.appendChild(el("h3", "", "Verification queue, 2xx not explained by a catch-all"));
+    root.appendChild(table(
+      [{h:"Signal"},{h:"Host"},{h:"Body size",n:true},{h:"Hits",n:true},
+       {h:"Distinct paths with this exact size",n:true},{h:"Read as"}],
+      queue.slice(0, 30).map(q => [
+        `<code>${esc(q.sig)}</code>`, `<code>${esc(q.host)}</code>`,
+        q.size ? bytes(q.size) : "0 B", fmt(q.n), fmt(q.paths),
+        q.paths >= 5
+          ? `<span class="pill warn">likely another catch-all</span>`
+          : `<span class="pill bad">verify by hand</span>`]),
+      { filters: queue.slice(0, 30).map(q =>
+          ({ f:{ signal:q.sig, host:q.host, bytesEq:q.size },
+             l:`Verify · ${q.sig} on ${q.host} (${q.size} B)` })) }));
+    root.insertAdjacentHTML("beforeend", `<p class="note">
+      Read the last two columns together. Several <i>different</i> filenames answering with a
+      byte-identical body is one template, not several leaked files, so those rows are near
+      certainly a second catch-all that just did not clear the dismissal threshold. A row with
+      a body size unique to one path is the one to open in a browser. Authenticated admin
+      traffic (Portainer, SnappyMail) also lands here: those are the operator's own sessions,
+      and what they evidence is an admin panel exposed to the internet, not an intrusion.</p>`);
+  }
+
+  sigs.slice(0, 6).forEach(([k, d]) => {
+    root.appendChild(el("h3", "", `Evidence, <code>${esc(k)}</code>`));
+    const sIps = d.ips.top(10), sPaths = d.paths.top(10);
+    const g = el("div", "grid g2");
+    const gi = card("Top source IPs", "");
+    gi.appendChild(table([{h:"IP"},{h:"Attempts",n:true}],
+      sIps.map(([i, v]) => [`<code>${esc(i)}</code>`, fmt(v)]),
+      { scroll:false, filters: sIps.map(([i]) =>
+        ({ f:{ signal:k, client:i }, l:`${k} from ${i}` })) }));
+    g.appendChild(gi);
+    const gp = card("Top targeted paths", "");
+    gp.appendChild(table([{h:"Path", trunc:true},{h:"Hits",n:true}],
+      sPaths.map(([p, v]) => [`<code>${esc(p)}</code>`, fmt(v)]),
+      { scroll:false, filters: sPaths.map(([p]) =>
+        ({ f:{ signal:k, path:p.split("?")[0] }, l:`${k} · ${p}` })) }));
+    g.appendChild(gp);
+    root.appendChild(g);
+    root.appendChild(table(
+      [{h:"When"},{h:"Client"},{h:"Host"},{h:"Request", trunc:true},{h:"Status",n:true}],
+      d.samples.map(x => [
+        x.ts.replace("T"," ").replace("Z",""), `<code>${esc(x.client)}</code>`, esc(x.host),
+        `<code>${esc((x.method||"") + " " + x.path + (x.query ? "?" + x.query : ""))}</code>`,
+        x.status ? `<span class="pill ${x.status[0]==="2"?"bad":"ok"}">${esc(x.status)}</span>`
+                 : `<span class="pill">err</span>`]),
+      { filters: d.samples.map(x => ({ f:{ signal:k, client:x.client }, l:`${k} from ${x.client}` })) }));
+  });
+
+  if (cat === "A09") a09(root);
+}
+
+/* A09 is not something an attacker sends, it is a property of the platform, so
+   it is audited from the shape of the corpus rather than counted from requests. */
+function a09(root) {
+  root.appendChild(el("h3", "", "Logging &amp; monitoring self-audit"));
+  const spanDays = A.statusByDay.size;
+  const rows = [
+    ["Retention window",
+     `${spanDays.toFixed(0)} days (${A.tsMin.slice(0,10)} → ${A.tsMax.slice(0,10)})`,
+     spanDays >= 90 ? "ok" : "warn",
+     "Below 90 days you cannot investigate a breach disclosed a quarter late. This history only exists because the container has not been recreated, it is not a retention policy."],
+    ["Docker json-file driver", "no max-size / max-file set", "warn",
+     "Logs grow unbounded until the disk fills, and are lost entirely when the container is recreated. Nothing is shipped off-box."],
+    ["scanners.log rotation", "unrotated, single file", "warn",
+     "The deny-default vhost appends forever with no logrotate entry."],
+    ["access_log off", "sitemap routes", "low",
+     "Sitemap fetches are invisible, so crawler sitemap activity cannot be measured."],
+    ["User agent in error log", "not recorded", "low",
+     "Error-log entries cannot be attributed to a client class, only to an IP."],
+    ["Centralised alerting", "none observed", "warn",
+     `${fmt(A.errLevel.get("emerg"))} [emerg] and ${fmt(A.klass[5])} 5xx events passed with no evidence of alerting.`],
+  ];
+  root.appendChild(table([{h:"Control"},{h:"Observed"},{h:"Rating"},{h:"Why it matters"}],
+    rows.map(r => [r[0], `<code>${esc(r[1])}</code>`,
+      `<span class="pill ${r[2]==="ok"?"ok":r[2]==="warn"?"warn":""}">${r[2]}</span>`, r[3]])));
+}
+
+/* --- F. Threat actors --------------------------------------------------- */
+section("actors", "Threat actors", s => {
+  s.appendChild(el("h2", "", "Threat actors"));
+  s.appendChild(el("p", "lede",
+    `Clients that tripped at least one attack signature, ranked by volume. Breadth matters more
+     than count: an IP firing one signal a thousand times is a dumb scanner, while an IP firing
+     eight different signals is someone working through a checklist.`));
+
+  const top = [...A.attacker.entries()].sort((a, b) => b[1].n - a[1].n).slice(0, 120);
+  s.insertAdjacentHTML("beforeend", `<div class="kpis">
+    ${kpi("Distinct attacking IPs", fmt(A.attacker.size), "external addresses, loopback excluded", "warn", { attack:true })}
+    ${kpi("Top offender volume", fmt(top.length ? top[0][1].n : 0), top.length ? top[0][0] : "—", "bad",
+          top.length ? { client:top[0][0] } : null)}
+    ${kpi("Multi-signal actors", fmt([...A.attacker.values()].filter(a => a.sigs.size >= 3).length),
+          "3+ distinct techniques", "bad", { attack:true })}
+  </div>`);
+
+  s.appendChild(el("h3", "", "Repeat offenders"));
+  s.appendChild(table(
+    [{h:"Client IP"},{h:"Attempts",n:true},{h:"Blocked",n:true},{h:"Techniques",n:true},
+     {h:"OWASP"},{h:"Targets", trunc:true},{h:"First seen"},{h:"Last seen"}],
+    top.map(([ip, a]) => [
+      `<code>${esc(ip)}</code>`, fmt(a.n), fmt(a.blocked), fmt(a.sigs.size),
+      [...a.owasp].sort().join(" "),
+      [...a.hosts].slice(0, 3).join(", "),
+      a.first.slice(0, 10), a.last.slice(0, 10)]),
+    { filters: top.map(([ip]) => ({ f:{ client:ip }, l:"All activity from " + ip })) }));
+
+  const btns = el("div"); btns.style.marginTop = "14px";
+  const b1 = el("button", "act", "Export nginx deny list");
+  b1.onclick = () => download("nginx-deny.conf",
+    "# Generated from " + A.tsMin.slice(0,10) + " .. " + A.tsMax.slice(0,10) + "\n" +
+    "# Clients with 3+ distinct attack techniques. Review before applying,\n" +
+    "# a shared NAT or a Cloudflare address would take innocents with it.\n" +
+    top.filter(([, a]) => a.sigs.size >= 3)
+       .map(([ip, a]) => `deny ${ip};  # ${a.n} attempts, ${a.sigs.size} techniques, ${[...a.owasp].sort().join("/")}`)
+       .join("\n") + "\n");
+  const b2 = el("button", "act", "Export Cloudflare IP list (CSV)");
+  b2.style.marginLeft = "8px";
+  b2.onclick = () => download("cloudflare-block.csv",
+    "ip,attempts,techniques,owasp,first_seen,last_seen\n" +
+    top.map(([ip, a]) => [ip, a.n, a.sigs.size, [...a.owasp].sort().join(" "),
+                          a.first, a.last].join(",")).join("\n") + "\n");
+  btns.appendChild(b1); btns.appendChild(b2);
+  s.appendChild(btns);
+  s.insertAdjacentHTML("beforeend", `<p class="note">
+    No geolocation or ASN column: that needs an offline database this box does not have, and a
+    guessed country is worse than no country. Note also that where a request arrived without an
+    X-Forwarded-For header the address shown is the connecting one, for Cloudflare-fronted
+    hosts that is an edge PoP, so <b>verify an address is not Cloudflare's before blocking it</b>.</p>`);
+
+  s.appendChild(el("h3", "", "Most common user agents"));
+  const uas = A.ua.top(25);
+  s.appendChild(table([{h:"User agent", trunc:true},{h:"Requests",n:true}],
+    uas.map(([k, v]) => [`<code>${esc(k)}</code>`, fmt(v)]),
+    { filters: uas.map(([k]) => ({ f:{ ua:k }, l:"User agent · " + k.slice(0, 60) })) }));
+});
+
+function download(name, text) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([text], { type:"text/plain" }));
+  a.download = name; a.click(); URL.revokeObjectURL(a.href);
+}
+
+/* --- G. Risk register --------------------------------------------------- */
+section("risk", "Risk register", s => {
+  s.appendChild(el("h2", "", "Risk register"));
+  s.appendChild(el("p", "lede", "Ranked by what would hurt most, with the action each one needs."));
+
+  const req = A.requests;
+  const served = realServedTotal(), soft = softServedTotal();
+  const e5 = A.klass[5], atk = [...A.owasp.m.values()].reduce((a, b) => a + b, 0);
+  const multi = [...A.attacker.values()].filter(a => a.sigs.size >= 3).length;
+  const spanDays = A.statusByDay.size;
+  const R = [];
+
+  if (served > 0) R.push(["high", `${plural(served, "attack-shaped request")} returned 2xx and ${served === 1 ? "is" : "are"} not yet explained`,
+    `Out of ${fmt(served + soft)} probes that got a success status, ${fmt(soft)} are provably a
+     catch-all page. The remaining ${fmt(served)} are <b>unexplained, not confirmed</b>, the
+     largest groups are authenticated Portainer and SnappyMail sessions (the operator's own),
+     and probes answered with a body size shared by several different filenames, which is another
+     template rather than a leak. <b>No confirmed data exposure was found in this window.</b>`,
+    "Work the <b>Verification queue</b> in the OWASP tab. It is ordered so the rows worth opening in a browser are the ones whose body size is unique to a single path."]);
+
+  R.push(["high", "The Docker control plane is reachable from the public internet",
+    `Portainer answers on <code>apps.tisaotechnologies.com/portainer/</code>, and phpLDAPadmin,
+     PostfixAdmin, SnappyMail and self-service-password are similarly exposed. Portainer can
+     start, stop and exec into every container on the host, including the database. A single
+     credential compromise is a whole-estate compromise, and the login page is available to
+     every scanner on the internet.`,
+    "Put the admin panels behind an allow-list, a VPN, or Cloudflare Access. This is the highest-leverage change on this list: it is configuration, not code, and it removes the worst-case blast radius."]);
+
+  const ca = catchAllHosts();
+  if (ca.length) {
+    const [h, info] = ca[0];
+    R.push(["high", "A vhost answers every unknown URL with 200 (soft-404)",
+      `<code>${esc(h)}</code> returns an identical ${fmt(+info.size)}-byte page for at least
+       ${fmt(info.paths)} distinct paths. That is why ${fmt(soft)} attack probes "succeeded":
+       <code>/.env</code>, <code>/.git/config</code> and a plugin readme all return the same
+       homepage. Nothing is exposed, but every scanner on the internet is being told everything
+       exists, which is an open invitation to keep probing, and Google indexes the duplicates.`,
+      "Make unknown paths return a real <b>404</b>. This is the same soft-404 fix already applied to Log explorer, not yet applied to the other properties." +
+      (ca.length > 1 ? ` Also affected: ${ca.slice(1, 5).map(x => "<code>" + esc(x[0]) + "</code>").join(", ")}.` : "")]);
+  }
+
+  if (e5 / Math.max(req,1) > 0.002) R.push(["high", "Server-error rate above target",
+    `${fmt(e5)} 5xx responses, ${pct(e5, req)} of traffic. The 502s trace to nginx caching the container IP at startup and never re-resolving.`,
+    "Chain <b>nginx -s reload</b> into every deploy, or give the proxied upstreams a <b>resolver</b> with a TTL so the address is re-looked-up."]);
+
+  R.push(["high", "Logs live only inside the container, unbounded and unshipped",
+    "The docker json-file driver has no max-size and no max-file, and nothing forwards these logs off the host. Recreating the container destroys the entire history, including the evidence in this report.",
+    "Set <b>max-size/max-file</b> in the compose logging config and ship to a collector. Until then, an incident older than the current container is uninvestigable."]);
+
+  if (multi > 0) R.push(["high", `${fmt(multi)} clients ran three or more distinct attack techniques`,
+    "Multiple techniques from one address is a checklist being worked, not background noise.",
+    "Export the deny list from the <b>Threat actors</b> tab and apply it at the Cloudflare edge, where it costs the origin nothing."]);
+
+  R.push(["med", `Hostile traffic is ${pct(atk, req)} of all requests`,
+    `${fmt(atk)} probing requests over ${spanDays.toFixed(0)} days, across every hosted service. Most are refused, but each one is origin CPU spent on an attacker.`,
+    "Move the obvious families (WordPress plugin paths on hosts that do not run WordPress, <code>.env</code> and <code>.git</code> fetches) to an edge rule so they never reach nginx."]);
+
+  const wpProbes = A.sigDetail.get("wp-plugin-probe");
+  if (wpProbes) R.push(["med", "WordPress is the single largest attack surface on the box",
+    `${fmt(wpProbes.count)} WordPress-specific probes, concentrated on ${wpProbes.hosts.top(3).map(x => x[0]).join(", ")}.`,
+    "Confirm core, themes and plugins are current on those hosts. A WordPress instance is only as safe as its least-maintained plugin."]);
+
+  if (A.errLevel.get("emerg")) R.push(["med", `${plural(A.errLevel.get("emerg"), "[emerg] event")} in the error log`,
+    "nginx's most severe level, the process could not do what it was told. Each is a window of degraded or absent service.",
+    "Read them in the <b>Availability</b> tab and fix the underlying config or port conflict."]);
+
+  if (spanDays < 90) R.push(["med", `Only ${spanDays.toFixed(0)} days of history exist`,
+    "Breaches are commonly disclosed months after the fact. A window shorter than a quarter means the logs will not reach back to the event.",
+    "Retain 90+ days off-box. This is also a prerequisite for most compliance regimes."]);
+
+  const c404 = [...A.crawler404.m.values()].reduce((a, b) => a + b, 0);
+  const cr = [...A.crawlerDay.m.values()].reduce((a, b) => a + b, 0);
+  if (c404 / Math.max(cr,1) > 0.05) R.push(["med", "Search crawlers are spending budget on 404s",
+    `${fmt(c404)} of ${fmt(cr)} crawler requests (${pct(c404, cr)}) hit a missing page.`,
+    "Work the list in the <b>SEO</b> tab: either restore the route or let it 404 deliberately so the index drops it."]);
+
+  if (A.emptyBodyN) R.push(["med", `${plural(A.emptyBodyN, "successful response")} had an empty body`,
+    `Requests across ${fmt(A.emptyBody.size)} distinct URLs returned <b>200 with zero bytes</b>, a blank page, served as a success.`,
+    "Check that generated pages are written to a temp file and <b>rename()</b>d into place. A non-atomic write means any request landing mid-write reads a zero-length file."]);
+
+  R.push(["low", "Sitemap routes are excluded from logging",
+    "<code>access_log off</code> on the sitemap locations means crawler sitemap fetches leave no trace.",
+    "Re-enable logging on those routes if sitemap pickup ever needs to be proven."]);
+
+  R.push(["low", "No geolocation or ASN enrichment available",
+    "Attacker attribution stops at the IP address.",
+    "Add an offline MaxMind or IPinfo database to the pipeline if country-level attribution is wanted."]);
+
+  R.forEach(([sev, title, what, act]) => {
+    s.insertAdjacentHTML("beforeend",
+      `<div class="risk ${sev}">
+         <h5><span class="pill ${sev==="crit"?"crit":sev==="high"?"bad":sev==="med"?"warn":"ok"}">${sev.toUpperCase()}</span>
+             &nbsp;${title}</h5>
+         <p>${what}</p><p class="do">→ ${act}</p></div>`);
+  });
+});
+
+/* --- H. Data quality ---------------------------------------------------- */
+section("data", "Data &amp; method", s => {
+  s.appendChild(el("h2", "", "Data &amp; method"));
+  s.appendChild(el("p", "lede",
+    "What this report is built from, and what it cannot tell you. Every number above is derived " +
+    "from these inputs and nothing else."));
+
+  s.appendChild(table([{h:"Property"},{h:"Value"}], [
+    ["Rows analysed", fmt(A.rows)],
+    ["access log (nginx stdout)", fmt(A.access)],
+    ["error log (nginx stderr)", fmt(A.error)],
+    ["scanners.log (deny-default vhost)", fmt(A.scanners)],
+    ["Window", `${A.tsMin} → ${A.tsMax}`],
+    ["Distinct hostnames", fmt(A.host.size)],
+    ["Distinct client IPs", fmt(A.uniqueClients.size)],
+    ["Distinct paths seen", fmt(A.path.size) + " (top-N retained; long tail pruned, so this is a floor)"],
+    ["Rows held for drill-down", fmt(S.n) + (S.overflow ? " (TRUNCATED, cap reached)" : " (all of them)")],
+    ["Distinct values indexed", `${fmt(S.dPath.a.length)} paths · ${fmt(S.dClient.a.length)} client IPs · ${fmt(S.dUA.a.length)} user agents`],
+  ].map(r => [r[0], `<code>${esc(r[1])}</code>`]), { scroll:false }));
+
+  // Multi-file provenance. With Apache and nginx logs mixed in one corpus, "how
+  // many rows came from where" is the first question to ask of any total.
+  if (S.dFile.a.length) {
+    const byFile = new Map();
+    for (let i = 0; i < S.n; i++) {
+      const k = S.file.a[i];
+      const e = byFile.get(k) || { n:0, min:Infinity, max:-Infinity };
+      e.n++;
+      if (S.ts.a[i] < e.min) e.min = S.ts.a[i];
+      if (S.ts.a[i] > e.max) e.max = S.ts.a[i];
+      byFile.set(k, e);
+    }
+    const rows = [...byFile.entries()].sort((a, b) => b[1].n - a[1].n);
+    s.appendChild(el("h3", "", "Source files"));
+    s.appendChild(table(
+      [{h:"File"},{h:"Rows",n:true},{h:"Share",n:true},{h:"From"},{h:"To"}],
+      rows.map(([k, e]) => [`<code>${esc(S.dFile.str(k))}</code>`, fmt(e.n), pct(e.n, S.n),
+        new Date(e.min).toISOString().slice(0, 10), new Date(e.max).toISOString().slice(0, 10)]),
+      { filters: rows.map(([k]) => ({ f:{ file:S.dFile.str(k) }, l:"File · " + S.dFile.str(k) })) }));
+    s.insertAdjacentHTML("beforeend", `<p class="note">
+      Files are combined by timestamp, not concatenated, so a chart spanning several logs is in
+      true chronological order. Each file's format is detected from its own contents, nginx
+      <code>main</code>, <code>combined</code>, <code>common/CLF</code>, and the nginx and
+      Apache error grammars, so Apache and nginx logs can be analysed side by side. Lines
+      matching no known grammar are written to <code>rejects.log</code> with a reason instead of
+      becoming rows of empty fields.</p>`);
+  }
+
+  // Skipped lines are shown, never silently swallowed. A high reject count with
+  // an unfamiliar reason usually means a log format this page does not know,
+  // which is a fixable gap, not a property of the data.
+  s.appendChild(el("h3", "", `Lines skipped (${fmt(A.rejected)})`));
+  if (!A.rejected) {
+    s.insertAdjacentHTML("beforeend",
+      `<p class="note">Every line in the input parsed cleanly.</p>`);
+  } else {
+    s.appendChild(table([{h:"Reason"},{h:"Lines",n:true}],
+      A.rejectReason.top(12).map(([k, v]) => [`<code>${esc(k)}</code>`, fmt(v)]), { scroll:false }));
+    s.appendChild(el("h3", "", "Examples of skipped lines"));
+    s.appendChild(table([{h:"File"},{h:"Reason"},{h:"Line", trunc:true}],
+      A.rejectSamples.slice(0, 20).map(r =>
+        [`<code>${esc(r.file)}</code>`, esc(r.reason), `<code>${esc(r.line)}</code>`])));
+    s.insertAdjacentHTML("beforeend", `<p class="note">
+      These are excluded deliberately. A half-parsed line becomes a row with empty fields, which
+      is indistinguishable from a real request that happened to have no referer, so it would
+      quietly distort every rate on the page. If these look like genuine log lines, the format
+      is one the parser does not yet know.</p>`);
+  }
+
+  s.appendChild(el("h3", "", "Limits worth stating"));
+  s.insertAdjacentHTML("beforeend", `<ul style="color:var(--dim);max-width:92ch">
+    <li><b>Response time is not logged.</b> The <code>main</code> format records no
+        <code>$request_time</code> or <code>$upstream_response_time</code>, so this report cannot
+        say how fast anything was. Adding those two variables to the log format is a one-line
+        change and would make latency measurable from the next entry onward.</li>
+    <li><b>"Unique visitors" is unique IPs</b>, not unique people. Mobile carriers NAT thousands
+        of readers behind one address; the true audience is larger.</li>
+    <li><b>Attack classification is signature-based.</b> It catches what looks like a known
+        technique. A targeted attacker who does not match a pattern is not in these counts,
+        absence of a signal is not evidence of safety.</li>
+    <li><b>Blocked does not mean harmless.</b> A 403 means nginx refused it; it says nothing
+        about whether the same actor succeeded elsewhere.</li>
+    <li><b>The error log has no user agent</b>, so error-log rows are excluded from the client-mix
+        breakdown and counted only in the security and availability views.</li>
+    <li><b>Internal addresses are not visitors.</b> Requests arriving with
+        <code>X-Forwarded-For: 127.0.0.1</code> or an RFC1918 address are the platform calling
+        itself. They are excluded from visitor counts and from the attacker ranking, counting
+        them there put loopback at the top of the threat table.</li>
+    <li><b>A blank host is not missing data.</b> <code>scanners.log</code> is written in
+        <code>combined</code> format, which has no <code>$host</code> field at all.</li>
+  </ul>`);
+});
+
+/* -------------------------------------------------------------------- boot */
+function render() {
+  const nav = $("#nav"), main = $("#main");
+  nav.innerHTML = ""; main.innerHTML = "";
+  SECTIONS.forEach((sec, i) => {
+    const b = el("button", i === 0 ? "on" : "", sec.label);
+    const node = el("section", i === 0 ? "on" : ""); node.id = "s-" + sec.id;
+    b.onclick = () => {
+      [...nav.children].forEach(x => x.classList.remove("on"));
+      [...main.children].forEach(x => x.classList.remove("on"));
+      b.classList.add("on"); node.classList.add("on");
+      if (!node.dataset.built) { sec.build(node); node.dataset.built = "1"; }
+      scrollTo(0, 0);
+    };
+    nav.appendChild(b); main.appendChild(node);
+  });
+  SECTIONS[0].build(main.firstChild);
+  main.firstChild.dataset.built = "1";
+
+  // Calendar days with traffic, the same figure every other panel uses. Taking
+  // the difference of the endpoint dates gave 77 here and 79 there, which reads
+  // as one of the two being wrong.
+  const spanDays = A.statusByDay.size;
+  $("#hdr").innerHTML =
+    `${fmt(A.rows)} log lines · ${A.tsMin.slice(0,10)} → ${A.tsMax.slice(0,10)} (${plural(spanDays, "day")}) ·
+     ${fmt(A.host.size)} distinct Host headers ·
+     ${plural(S.dFile.a.length, "source file")}${A.rejected ? ` · ${fmt(A.rejected)} lines skipped` : ""}
+     <span class="pill">click any figure to see its log rows</span>`;
+  drawerInit();
+  $("#loader").style.display = "none";
+}
+
+/* Chunked streaming decode. The tail of each chunk is carried forward because a
+   read boundary lands mid-line far more often than not.
+
+   Handles both inputs. A file is CSV if its first line is the known header;
+   anything else is treated as a raw log and each line is sniffed and parsed
+   in-page. Several files can be loaded together, they are merged into the same
+   aggregates, and the drill-down sorts by timestamp rather than assuming input
+   order, so an Apache log and an nginx log interleave correctly. */
+async function ingest(stream, totalBytes, fileName) {
+  const dec = new TextDecoder("utf-8");
+  const reader = stream.getReader();
+  const name = fileName || "logs.csv";
+  let tail = "", read = 0, first = true, lines = 0, isCSV = false, prevTS = "", isErrLog = null;
+  const t0 = performance.now();
+  $("#prog").style.display = "block";
+  $("#drop").style.display = "none";
+
+  const take = ln => {
+    if (!ln) return;
+    if (first) {
+      first = false;
+      isCSV = ln.startsWith("ts,source,level,host") || ln.startsWith("ts,source,");
+      if (isCSV) return;                       // header row, not data
+    }
+    if (isCSV) {
+      const f = parseLine(ln);
+      if (f.length < 18) { reject(name, ln, "short CSV row"); return; }
+      if (!f[C.FILE]) f[C.FILE] = name;
+      consume(f); lines++;
+      return;
+    }
+    const r = parseRawLine(ln, prevTS, isErrLog);
+    if (!r.f) { reject(name, ln, r.reason); return; }
+    // The file's kind is set by its first decodable line and then trusted, so a
+    // stray unparsable line cannot flip an access log into an error log.
+    if (isErrLog === null) isErrLog = r.f[C.SRC] === "error";
+    if (isErrLog === false && /scanners\.log/i.test(name)) r.f[C.SRC] = "scanners";
+    r.f[C.FILE] = name;
+    prevTS = r.f[C.TS];
+    consume(r.f); lines++;
+  };
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    read += value.length;
+    const parts = (tail + dec.decode(value, { stream:true })).split("\n");
+    tail = parts.pop();
+    for (const ln of parts) take(ln.replace(/\r$/, ""));
+    if (totalBytes) $("#prog>i").style.width = (100 * read / totalBytes).toFixed(1) + "%";
+    const rate = lines / ((performance.now() - t0) / 1000);
+    $("#stat").textContent =
+      `${name} · ${fmt(lines)} rows${isCSV ? "" : " (raw log)"} · ` +
+      `${bytes(read)}${totalBytes ? " of " + bytes(totalBytes) : ""} · ${fmt(Math.round(rate))} lines/sec`;
+    await new Promise(r => setTimeout(r));      // yield so the bar actually paints
+  }
+  if (tail) take(tail.replace(/\r$/, ""));
+  $("#stat").textContent = `${name}: ${fmt(lines)} rows in ${((performance.now()-t0)/1000).toFixed(1)}s`;
+  await new Promise(r => setTimeout(r, 20));
+}
+
+function reject(file, line, reason) {
+  A.rejected++;
+  A.rejectReason.add(reason || "unknown");
+  if (A.rejectSamples.length < 40) A.rejectSamples.push({ file, reason, line: line.slice(0, 220) });
+}
+
+/* Loads one or more files, then renders once. */
+async function ingestAll(files) {
+  for (const f of files) {
+    try { await ingest(f.stream(), f.size, f.name); }
+    catch (e) { console.error(f.name, e); reject(f.name, "", "could not be read: " + e.message); }
+  }
+  finish();
+}
+
+function finish() {
+  if (!A.rows) {
+    $("#stat").textContent = A.rejected
+      ? `No usable rows. ${fmt(A.rejected)} lines matched no known log format, is this an nginx or Apache log?`
+      : "That file has no rows the parser recognised.";
+    $("#drop").style.display = "";
+    return;
+  }
+  $("#stat").textContent = "rendering…";
+  setTimeout(render, 20);
+}
+
+function wire() {
+  const drop = $("#drop"), file = $("#file");
+  drop.onclick = () => file.click();
+  file.onchange = () => file.files.length && ingestAll([...file.files]);
+  ["dragenter","dragover"].forEach(e =>
+    document.addEventListener(e, ev => { ev.preventDefault(); drop.classList.add("hot"); }));
+  ["dragleave","drop"].forEach(e =>
+    document.addEventListener(e, ev => { ev.preventDefault(); drop.classList.remove("hot"); }));
+  document.addEventListener("drop", ev => {
+    const fs = [...ev.dataTransfer.files];
+    if (fs.length) ingestAll(fs);
+  });
+
+  // Auto-load when served over http(s). Under file:// this throws immediately and
+  // the drop zone stays up, which is the expected path for a local open.
+  if (location.protocol.startsWith("http")) {
+    $("#stat").textContent = "Looking for logs.csv…";
+    fetch("logs.csv").then(r => {
+      if (!r.ok) throw new Error(r.status);
+      return ingest(r.body, +r.headers.get("content-length") || 0, "logs.csv").then(finish);
+    }).catch(() => { $("#stat").textContent =
+      "No logs.csv alongside this page, drop a CSV or a raw .log file instead."; });
+  }
+}
+wire();
+</script>
+</body>
+</html>
