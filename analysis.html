@@ -1218,8 +1218,16 @@ document.addEventListener("click", e => {
   catch (err) { console.error("bad filter", t.dataset.f, err); }
 });
 
+document.addEventListener("keydown", e => {
+  if ((e.key !== "Enter" && e.key !== " ") || !document.activeElement) return;
+  const t = document.activeElement.closest?.("[data-f]");
+  if (!t) return;
+  e.preventDefault();
+  t.click();
+});
+
 const F = (filter, label) =>
-  ` data-f='${esc(JSON.stringify(filter)).replace(/'/g, "&#39;")}' data-l="${esc(label)}"`;
+  ` data-f='${esc(JSON.stringify(filter)).replace(/'/g, "&#39;")}' data-l="${esc(label)}" role="button" tabindex="0" aria-label="${esc(label)}"`;
 
 /* --------------------------------------------------------------- rendering */
 /* `opts.filters` is an array parallel to `rows`: filters[i] is {f, l} and makes
